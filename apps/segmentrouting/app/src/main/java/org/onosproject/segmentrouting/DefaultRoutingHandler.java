@@ -15,7 +15,6 @@
  */
 package org.onosproject.segmentrouting;
 
-import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMap.Builder;
 import com.google.common.collect.ImmutableSet;
@@ -62,7 +61,6 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
-import static com.google.common.base.MoreObjects.toStringHelper;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static org.onlab.util.Tools.groupedThreads;
@@ -77,6 +75,7 @@ public class DefaultRoutingHandler {
     private static final int RETRY_INTERVAL_SCALE = 1;
     private static final long STABLITY_THRESHOLD = 10; //secs
     private static final long MASTER_CHANGE_DELAY = 1000; // ms
+    private static final long PURGE_DELAY = 1000; // ms
     private static Logger log = LoggerFactory.getLogger(DefaultRoutingHandler.class);
 
     private SegmentRoutingManager srManager;
@@ -90,8 +89,11 @@ public class DefaultRoutingHandler {
         = newScheduledThreadPool(1, groupedThreads("retryftr", "retry-%d", log));
     private ScheduledExecutorService executorServiceMstChg
         = newScheduledThreadPool(1, groupedThreads("masterChg", "mstch-%d", log));
+    private ScheduledExecutorService executorServiceFRR
+        = newScheduledThreadPool(1, groupedThreads("fullRR", "fullRR-%d", log));
 
     private Instant lastRoutingChange = Instant.EPOCH;
+    private Instant lastFullReroute = Instant.EPOCH;
 
     // Distributed store to keep track of ONOS instance that should program the
     // device pair. There should be only one instance (the king) that programs the same pair.
@@ -201,6 +203,7 @@ public class DefaultRoutingHandler {
     public void shutdown() {
         executorService.shutdown();
         executorServiceMstChg.shutdown();
+        executorServiceFRR.shutdown();
     }
 
     //////////////////////////////////////
@@ -432,10 +435,8 @@ public class DefaultRoutingHandler {
      *            seen link
      */
     // TODO This method should be refactored into three separated methods
-    public void populateRoutingRulesForLinkStatusChange(Link linkDown,
-                                                           Link linkUp,
-                                                           DeviceId switchDown,
-                                                           boolean seenBefore) {
+    public void populateRoutingRulesForLinkStatusChange(Link linkDown, Link linkUp,
+                                                        DeviceId switchDown, boolean seenBefore) {
         if (Stream.of(linkDown, linkUp, switchDown).filter(Objects::nonNull)
                 .count() != 1) {
             log.warn("Only one event can be handled for link status change .. aborting");
@@ -505,20 +506,10 @@ public class DefaultRoutingHandler {
                 // link has gone down
                 // Compare existing ECMP SPG only with the link that went down
                 routeChanges = computeDamagedRoutes(linkDown);
-                if (routeChanges != null) {
-                    processHashGroupChange(routeChanges, true, null);
-                    // clear out routesChanges so a re-route is not attempted
-                    routeChanges = ImmutableSet.of();
-                    hashGroupsChanged = true;
-                }
-            }
-
-            // do full re-routing if optimized routing returns null routeChanges
-            if (routeChanges == null) {
-                log.warn("Optimized routing failed... opting for full reroute");
-                populationStatus = Status.ABORTED;
-                populateAllRoutingRules();
-                return;
+                processHashGroupChange(routeChanges, true, null);
+                // clear out routesChanges so a re-route is not attempted
+                routeChanges = ImmutableSet.of();
+                hashGroupsChanged = true;
             }
 
             if (routeChanges.isEmpty()) {
@@ -790,7 +781,7 @@ public class DefaultRoutingHandler {
                 DeviceId dstSw = route.get(1); // same as impactedDstDevice
                 Set<DeviceId> nextHops = getNextHops(targetSw, dstSw);
                 if (nextHops.isEmpty()) {
-                    log.warn("Could not find next hop from target:{} --> dst {} "
+                    log.debug("Could not find next hop from target:{} --> dst {} "
                             + "skipping this route", targetSw, dstSw);
                     continue;
                 }
@@ -946,7 +937,6 @@ public class DefaultRoutingHandler {
            }
         }
 
-
         // To save on ECMP groups
         // avoid MPLS rules in non-edge-devices to non-edge-devices
         // avoid MPLS transit rules in edge-devices
@@ -1071,7 +1061,7 @@ public class DefaultRoutingHandler {
                     (revoke) ? "revoke" : "repopulate", route);
             return false;
         }
-        log.debug("{} hash-groups buckets For Route {} -> {} to next-hops {}",
+        log.debug("{} hash-groups buckets For Route {} -> {} to new next-hops {}",
                   (revoke) ? "revoke" : "repopulating",
                   targetSw, destSw, nextHops);
         return (revoke) ? grpHandler.fixHashGroups(targetSw, nextHops,
@@ -1264,7 +1254,6 @@ public class DefaultRoutingHandler {
     void purgeEcmpGraph(DeviceId deviceId) {
         statusLock.lock();
         try {
-
             if (populationStatus == Status.STARTED) {
                 log.warn("Previous rule population is not finished. Cannot"
                         + " proceeed with purgeEcmpGraph for {}", deviceId);
@@ -1302,6 +1291,7 @@ public class DefaultRoutingHandler {
         private static final long CLUSTER_EVENT_THRESHOLD = 4500; // ms
         private static final long DEVICE_EVENT_THRESHOLD = 2000; // ms
         private static final long EDGE_PORT_EVENT_THRESHOLD = 10000; //ms
+        private static final long FULL_REROUTE_THRESHOLD = 10000; // ms
 
         MasterChange(DeviceId devId, MastershipEvent me) {
             this.devId = devId;
@@ -1354,12 +1344,29 @@ public class DefaultRoutingHandler {
                 if (srManager.mastershipService.isLocalMaster(devId)) {
                     // old master could have died when populating filters
                     populatePortAddressingRules(devId);
-                    // old master could have died when creating groups
-                    srManager.purgeHashedNextObjectiveStore(devId);
                 }
+                // old master could have died when creating groups
                 // XXX right now we have no fine-grained way to only make changes
-                // for the route paths affected by this device.
-                populateAllRoutingRules();
+                // for the route paths affected by this device. Thus we do a
+                // full reroute after purging all hash groups. We also try to do
+                // it only once, irrespective of the number of devices
+                // that changed mastership when their master instance died.
+                long lfrr = Instant.now().toEpochMilli() - lastFullReroute.toEpochMilli();
+                boolean doFullReroute = lfrr > FULL_REROUTE_THRESHOLD;
+                if (doFullReroute) {
+                    lastFullReroute = Instant.now();
+                    for (Device dev : srManager.deviceService.getDevices()) {
+                        if (shouldProgram(dev.id())) {
+                            srManager.purgeHashedNextObjectiveStore(dev.id());
+                        }
+                    }
+                    // give small delay to ensure entire store is purged
+                    executorServiceFRR.schedule(new FullRerouteAfterPurge(),
+                                                PURGE_DELAY,
+                                                TimeUnit.MILLISECONDS);
+                } else {
+                    log.warn("Full reroute attempted {} ms ago .. skipping", lfrr);
+                }
 
             } else if (edgePortEvent && clusterEvent) {
                 log.warn("Mastership changed for dev: {}/{} due to clusterEvent {} ms ago "
@@ -1382,18 +1389,31 @@ public class DefaultRoutingHandler {
         }
     }
 
+    /**
+     * Performs a full reroute of routing rules in all the switches. Assumes
+     * caller has purged hash groups from the nextObjective store, otherwise
+     * re-uses ones available in the store.
+     */
+    protected final class FullRerouteAfterPurge implements Runnable {
+        @Override
+        public void run() {
+            populateAllRoutingRules();
+        }
+    }
+
+
     //////////////////////////////////////
     //  Routing helper methods and classes
     //////////////////////////////////////
 
     /**
-     * Computes set of affected routes due to failed link. Assumes
-     * previous ecmp shortest-path graph exists for a switch in order to compute
-     * affected routes. If such a graph does not exist, the method returns null.
+     * Computes set of affected routes due to failed link. Assumes previous ecmp
+     * shortest-path graph exists for a switch in order to compute affected
+     * routes. If such a graph does not exist, the method returns null.
      *
      * @param linkFail the failed link
      * @return the set of affected routes which may be empty if no routes were
-     *         affected, or null if no previous ecmp spg was found for comparison
+     *         affected
      */
     private Set<ArrayList<DeviceId>> computeDamagedRoutes(Link linkFail) {
         Set<ArrayList<DeviceId>> routes = new HashSet<>();
@@ -1408,17 +1428,26 @@ public class DefaultRoutingHandler {
             for (DeviceId rootSw : deviceAndItsPair(sw.id())) {
                 // check for mastership change since last run
                 if (!lastProgrammed.contains(sw.id())) {
-                    lastProgrammed.add(sw.id());
-                    log.warn("New reponsibility for this node to program dev:{}"
+                    log.warn("New responsibility for this node to program dev:{}"
                             + " ... nuking current ECMPspg", sw.id());
                     currentEcmpSpgMap.remove(sw.id());
                 }
+                lastProgrammed.add(sw.id());
+
                 EcmpShortestPathGraph ecmpSpg = currentEcmpSpgMap.get(rootSw);
                 if (ecmpSpg == null) {
-                    log.warn("No existing ECMP graph for switch {}. Aborting optimized"
-                            + " rerouting and opting for full-reroute", rootSw);
-                    return null;
+                    log.warn("No existing ECMP graph for switch {}. Assuming "
+                            + "all route-paths have changed towards it.", rootSw);
+                    for (DeviceId targetSw : srManager.deviceConfiguration.getRouters()) {
+                        if (targetSw.equals(rootSw)) {
+                            continue;
+                        }
+                        routes.add(Lists.newArrayList(targetSw, rootSw));
+                        log.debug("Impacted route:{}->{}", targetSw, rootSw);
+                    }
+                    continue;
                 }
+
                 if (log.isDebugEnabled()) {
                     log.debug("Root switch: {}", rootSw);
                     log.debug("  Current/Existing SPG: {}", ecmpSpg);
@@ -1490,11 +1519,11 @@ public class DefaultRoutingHandler {
                 }
                 // check for mastership change since last run
                 if (!lastProgrammed.contains(sw.id())) {
-                    lastProgrammed.add(sw.id());
-                    log.warn("New reponsibility for this node to program dev:{}"
+                    log.warn("New responsibility for this node to program dev:{}"
                             + " ... nuking current ECMPspg", sw.id());
                     currentEcmpSpgMap.remove(sw.id());
                 }
+                lastProgrammed.add(sw.id());
                 EcmpShortestPathGraph currEcmpSpg = currentEcmpSpgMap.get(rootSw);
                 if (currEcmpSpg == null) {
                     log.debug("No existing ECMP graph for device {}.. adding self as "
@@ -1663,19 +1692,19 @@ public class DefaultRoutingHandler {
         NodeId currentNodeId = srManager.clusterService.getLocalNode().id();
         NodeId masterNodeId = srManager.mastershipService.getMasterFor(deviceId);
         Optional<NodeId> pairMasterNodeId = pairDeviceId.map(srManager.mastershipService::getMasterFor);
-        log.debug("Evaluate shouldProgram {}/pair={}. current={}, master={}, pairMaster={}",
+        log.debug("Evaluate shouldProgram {}/pair={}. currentNodeId={}, master={}, pairMaster={}",
                 deviceId, pairDeviceId, currentNodeId, masterNodeId, pairMasterNodeId);
 
         // No pair device configured. Only handle when current instance is the master of the device
         if (!pairDeviceId.isPresent()) {
-            log.debug("No pair device. current={}, master={}", currentNodeId, masterNodeId);
+            log.debug("No pair device. currentNodeId={}, master={}", currentNodeId, masterNodeId);
             return currentNodeId.equals(masterNodeId);
         }
 
         // Should not handle if current instance is not the master of either switch
         if (!currentNodeId.equals(masterNodeId) &&
                 !(pairMasterNodeId.isPresent() && currentNodeId.equals(pairMasterNodeId.get()))) {
-            log.debug("Current node {} is neither the master of target device {} nor pair device {}",
+            log.debug("Current nodeId {} is neither the master of target device {} nor pair device {}",
                     currentNodeId, deviceId, pairDeviceId);
             return false;
         }
@@ -1698,7 +1727,7 @@ public class DefaultRoutingHandler {
         }));
 
         if (king != null) {
-            log.debug("{} should handle routing for {}/pair={}", king, deviceId, pairDeviceId);
+            log.debug("{} is king, should handle routing for {}/pair={}", king, deviceId, pairDeviceId);
             shouldProgramCache.put(deviceId, king.equals(currentNodeId));
             return king.equals(currentNodeId);
         } else {
@@ -1784,7 +1813,7 @@ public class DefaultRoutingHandler {
                                 log.warn(e.getMessage());
                             }
                             if (pathdevIsEdge) {
-                                log.debug("Avoiding {} hop path for non-edge targetSw:{}"
+                                log.debug("Avoiding {} hop path for targetSw:{}"
                                         + " --> dstSw:{} which goes through an edge"
                                         + " device {} in path {}", itrIdx,
                                           targetSw, dstSw, pathdev, via);
@@ -1812,54 +1841,6 @@ public class DefaultRoutingHandler {
         return ImmutableSet.of(); //no next-hops found
     }
 
-    /**
-     * Represents two devices that are paired by configuration. An EdgePair for
-     * (dev1, dev2) is the same as as EdgePair for (dev2, dev1)
-     */
-    protected final class EdgePair {
-        DeviceId dev1;
-        DeviceId dev2;
-
-        EdgePair(DeviceId dev1, DeviceId dev2) {
-            this.dev1 = dev1;
-            this.dev2 = dev2;
-        }
-
-        boolean includes(DeviceId dev) {
-            return dev1.equals(dev) || dev2.equals(dev);
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) {
-                return true;
-            }
-            if (!(o instanceof EdgePair)) {
-                return false;
-            }
-            EdgePair that = (EdgePair) o;
-            return ((this.dev1.equals(that.dev1) && this.dev2.equals(that.dev2)) ||
-                    (this.dev1.equals(that.dev2) && this.dev2.equals(that.dev1)));
-        }
-
-        @Override
-        public int hashCode() {
-            if (dev1.toString().compareTo(dev2.toString()) <= 0) {
-                return Objects.hash(dev1, dev2);
-            } else {
-                return Objects.hash(dev2, dev1);
-            }
-        }
-
-        @Override
-        public String toString() {
-            return toStringHelper(this)
-                    .add("Dev1", dev1)
-                    .add("Dev2", dev2)
-                    .toString();
-        }
-    }
-
     //////////////////////////////////////
     //  Filtering rule creation
     //////////////////////////////////////
@@ -1882,49 +1863,6 @@ public class DefaultRoutingHandler {
         }
         executorService.schedule(new RetryFilters(deviceId, firstRun),
                                  RETRY_INTERVAL_MS, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * Utility class used to temporarily store information about the ports on a
-     * device processed for filtering objectives.
-     */
-    public final class PortFilterInfo {
-        int disabledPorts = 0, errorPorts = 0, filteredPorts = 0;
-
-        public PortFilterInfo(int disabledPorts, int errorPorts,
-                           int filteredPorts) {
-            this.disabledPorts = disabledPorts;
-            this.filteredPorts = filteredPorts;
-            this.errorPorts = errorPorts;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(disabledPorts, filteredPorts, errorPorts);
-        }
-
-        @Override
-        public boolean equals(Object obj) {
-            if (this == obj) {
-                return true;
-            }
-            if ((obj == null) || (!(obj instanceof PortFilterInfo))) {
-                return false;
-            }
-            PortFilterInfo other = (PortFilterInfo) obj;
-            return ((disabledPorts == other.disabledPorts) &&
-                    (filteredPorts == other.filteredPorts) &&
-                    (errorPorts == other.errorPorts));
-        }
-
-        @Override
-        public String toString() {
-            MoreObjects.ToStringHelper helper = toStringHelper(this)
-                    .add("disabledPorts", disabledPorts)
-                    .add("errorPorts", errorPorts)
-                    .add("filteredPorts", filteredPorts);
-            return helper.toString();
-        }
     }
 
     /**
@@ -1963,5 +1901,4 @@ public class DefaultRoutingHandler {
             prevRun = (thisRun == null) ? prevRun : thisRun;
         }
     }
-
 }

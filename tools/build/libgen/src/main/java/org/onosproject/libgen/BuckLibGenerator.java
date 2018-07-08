@@ -55,6 +55,8 @@ public class BuckLibGenerator {
     private final List<BuckArtifact> artifacts = new ArrayList<>();
     private final List<BuckLibrary> libraries = new ArrayList<>();
 
+    private static boolean generateForBazel = false;
+
     /**
      * Main entry point.
      *
@@ -64,6 +66,10 @@ public class BuckLibGenerator {
         if (args.length < 2) {
             System.err.println("Not enough args.\n\nUSAGE: <json file> <output>");
             System.exit(5);
+        }
+
+        if (args.length == 3 && "--bazel".equals(args[2])) {
+            generateForBazel = true;
         }
 
         // Parse args
@@ -107,14 +113,14 @@ public class BuckLibGenerator {
         System.out.flush();
         BuckArtifact buckArtifact;
         if (uri.startsWith("http")) {
-            String sha = getHttpSha(name, uri);
-            buckArtifact = BuckArtifact.getArtifact(name, uri, sha);
+            String sha = generateForBazel ? getHttpSha256(name, uri) : getHttpSha1(name, uri);
+            buckArtifact = BuckArtifact.getArtifact(name, uri, sha, generateForBazel);
         } else if (uri.startsWith("mvn")) {
             uri = uri.replaceFirst("mvn:", "");
 //            if (repo != null) {
 //                System.out.println(name + " " + repo);
 //            }
-            buckArtifact = AetherResolver.getArtifact(name, uri, repo);
+            buckArtifact = AetherResolver.getArtifact(name, uri, repo, generateForBazel);
         } else {
             throw new RuntimeException("Unsupported artifact uri: " + uri);
         }
@@ -145,7 +151,7 @@ public class BuckLibGenerator {
             libraryTargets.add(name);
         });
 
-        return BuckLibrary.getLibrary(libraryName, libraryTargets);
+        return BuckLibrary.getLibrary(libraryName, libraryTargets, generateForBazel);
     }
 
     public BuckLibGenerator resolve() {
@@ -170,6 +176,46 @@ public class BuckLibGenerator {
         return this;
     }
 
+    private String generateArtifacts() {
+        StringBuilder sb = new StringBuilder();
+        if (!generateForBazel) {
+            artifacts.forEach(artifact -> sb.append(artifact.getBuckFragment()));
+        } else {
+            StringBuilder mavenJars = new StringBuilder();
+            StringBuilder javaLibraries = new StringBuilder();
+
+            mavenJars.append("\ndef generated_maven_jars():");
+            javaLibraries.append("\ndef generated_java_libraries():");
+
+            artifacts.forEach(artifact -> {
+                mavenJars.append(artifact.getBazelMavenJarFragment());
+                javaLibraries.append(artifact.getBazelJavaLibraryFragment());
+            });
+
+            sb.append(mavenJars).append(javaLibraries);
+        }
+        return sb.toString();
+    }
+
+    private String generateArtifactMap() {
+        StringBuilder artifactMap = new StringBuilder();
+
+        artifactMap.append("\nartifact_map = {}");
+
+        artifacts.forEach(artifact -> {
+            artifactMap.append("\nartifact_map[str(Label(\"" + artifact.bazelExport() + "\"))] = \"" + artifact.url(true) + "\"");
+        });
+
+        artifactMap.append("\n\ndef maven_coordinates(label):\n" +
+                "    label_string = str(label)\n" +
+                "    if label_string in artifact_map:\n" +
+                "        return artifact_map[label_string]\n" +
+                "    else:\n" +
+                "        return \"mvn:%s:%s:%s\" % (ONOS_GROUP_ID, label.name, ONOS_VERSION)\n");
+
+        return artifactMap.toString();
+    }
+
     void write(String outputFilePath) {
         DateTimeFormatter formatter = DateTimeFormatter.RFC_1123_DATE_TIME.withZone(ZoneId.of("UTC"));
         File outputFile = new File(outputFilePath);
@@ -182,17 +228,24 @@ public class BuckLibGenerator {
                     formatter.format(Instant.now())));
             writer.write("# ***** Use onos-lib-gen *****\n");
 
-            // rule to publish the onos dependency pom
-            writer.write("\npass_thru_pom(\n" +
-                         "    name = 'onos-dependencies-pom',\n" +
-                         "    src = 'pom.xml',\n" +
-                         "    out = 'onos-dependencies.pom',\n" +
-                         "    artifactId = 'onos-dependencies',\n" +
-                         ")\n\n");
+            if (!generateForBazel) {
+                // TODO - have to do this somehow for bazel
+                // rule to publish the onos dependency pom
+                writer.write("\npass_thru_pom(\n" +
+                        "    name = 'onos-dependencies-pom',\n" +
+                        "    src = 'pom.xml',\n" +
+                        "    out = 'onos-dependencies.pom',\n" +
+                        "    artifactId = 'onos-dependencies',\n" +
+                        ")\n\n");
+            } else {
+                writer.write("\nload(\"//tools/build/bazel:variables.bzl\", \"ONOS_GROUP_ID\", \"ONOS_VERSION\")\n\n");
+            }
 
-
-            libraries.forEach(library -> writer.print(library.getBuckFragment()));
-            artifacts.forEach(artifact -> writer.print(artifact.getBuckFragment()));
+            libraries.forEach(library -> writer.print(library.getFragment()));
+            writer.print(generateArtifacts());
+            if (generateForBazel) {
+                writer.print(generateArtifactMap());
+            }
             writer.flush();
         } catch (FileNotFoundException e) {
             error("File not found: %s", outputFilePath);
@@ -202,10 +255,18 @@ public class BuckLibGenerator {
         }
     }
 
-    String getHttpSha(String name, String urlStr) {
+    String getHttpSha1(String name, String urlStr) {
+        return getHttpSha(name, urlStr, "SHA-1");
+    }
+
+    String getHttpSha256(String name, String urlStr) {
+        return getHttpSha(name, urlStr, "SHA-256");
+    }
+
+    String getHttpSha(String name, String urlStr, String algorithm) {
         //FIXME need http download cache
         try {
-            MessageDigest md = MessageDigest.getInstance("SHA-1");
+            MessageDigest md = MessageDigest.getInstance(algorithm);
             byte[] buffer = new byte[8192];
 
             URL url = new URL(urlStr);
@@ -225,7 +286,7 @@ public class BuckLibGenerator {
                 .filter(File::canRead)
                 .findAny();
 
-            if (cache.isPresent()) {
+            if (cache.isPresent() && !generateForBazel) {
                 try (FileInputStream stream = new FileInputStream(cache.get())) {
                     int read;
                     while ((read = stream.read(buffer)) >= 0) {

@@ -16,6 +16,7 @@
 package org.onosproject.net.device.impl;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.util.concurrent.Futures;
@@ -420,6 +421,12 @@ public class DeviceManager
         checkNotNull(deviceId, PORT_NUMBER_NULL);
         NodeId masterId = mastershipService.getMasterFor(deviceId);
 
+        if (masterId == null) {
+            // No master found; device is offline
+            log.info("No master found for port state change for {}", deviceId);
+            return;
+        }
+
         if (!masterId.equals(localNodeId)) {
             //Send the request to the master node for the device
             log.info("Device {} is managed by {}, forwarding the request to the MASTER",
@@ -464,7 +471,7 @@ public class DeviceManager
                         //relinquish master role and ability to be backup.
                         mastershipService.relinquishMastership(deviceId).get();
                     } catch (InterruptedException e) {
-                        log.warn("Interrupted while reliquishing role for {}", deviceId);
+                        log.warn("Interrupted while relinquishing role for {}", deviceId);
                         Thread.currentThread().interrupt();
                     } catch (ExecutionException e) {
                         log.error("Exception thrown while relinquishing role for {}", deviceId, e);
@@ -666,7 +673,9 @@ public class DeviceManager
             }
             PortDescriptionsConfig portConfig = networkConfigService.getConfig(deviceId, PortDescriptionsConfig.class);
             if (portConfig != null) {
-                //updating the ports if configration exists
+                // Updating the ports if configuration exists (on new lists as
+                // the passed one might be immutable)
+                portDescriptions = Lists.newArrayList(portDescriptions);
                 portDescriptions.addAll(portConfig.portDescriptions());
             }
             portDescriptions = portDescriptions.stream()
@@ -789,8 +798,9 @@ public class DeviceManager
                 }
             } else {
                 // we didn't get back what we asked for. Reelect someone else.
-                log.warn("Failed to assert role [{}] onto Device {}", response, deviceId);
-                if (response == MastershipRole.MASTER) {
+                log.warn("Failed to assert role onto device {}. requested={}, response={}",
+                         deviceId, requested, response);
+                if (requested == MastershipRole.MASTER) {
                     mastershipService.relinquishMastership(deviceId);
                     // TODO: Shouldn't we be triggering event?
                     //final Device device = getDevice(deviceId);
@@ -980,7 +990,19 @@ public class DeviceManager
         public void notify(DeviceEvent event) {
             post(event);
             if (event.type().equals(DeviceEvent.Type.DEVICE_REMOVED)) {
-                deviceLocalStatus.remove(event.subject().id());
+                // When device is administratively removed, force disconnect.
+                DeviceId deviceId = event.subject().id();
+                deviceLocalStatus.remove(deviceId);
+
+                DeviceProvider provider = getProvider(deviceId);
+                if (provider != null) {
+                    log.info("Triggering disconnect for device {}", deviceId);
+                    try {
+                        provider.triggerDisconnect(deviceId);
+                    } catch (UnsupportedOperationException e) {
+                        log.warn("Unable to trigger disconnect due to {}", e.getMessage());
+                    }
+                }
             }
         }
     }
@@ -1023,7 +1045,8 @@ public class DeviceManager
                     && (event.configClass().equals(BasicDeviceConfig.class)
                     || portOpsIndex.containsKey(event.configClass())
                     || event.configClass().equals(PortDescriptionsConfig.class)
-                    || event.configClass().equals(DeviceAnnotationConfig.class));
+                    || event.configClass().equals(DeviceAnnotationConfig.class))
+                    && mastershipService.isLocalMaster((DeviceId) event.subject());
         }
 
         @Override

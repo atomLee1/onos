@@ -106,7 +106,7 @@ public class AclManager implements AclService {
     private class InternalHostListener implements HostListener {
 
         /**
-         * Generate new ACL flow rules for new host following the given ACL rule.
+         * Generate new ACL flow rules for new or updated host following the given ACL rule.
          */
         private void processHostAddedEvent(HostEvent event, AclRule rule) {
             DeviceId deviceId = event.subject().location().deviceId();
@@ -130,9 +130,9 @@ public class AclManager implements AclService {
 
         @Override
         public void event(HostEvent event) {
-            // if a new host appears and an existing rule denies
+            // if a new host appears or is updated and an existing rule denies
             // its traffic, a new ACL flow rule is generated.
-            if (event.type() == HostEvent.Type.HOST_ADDED) {
+            if (event.type() == HostEvent.Type.HOST_ADDED || event.type() == HostEvent.Type.HOST_UPDATED) {
                 DeviceId deviceId = event.subject().location().deviceId();
                 if (mastershipService.getLocalRole(deviceId) == MastershipRole.MASTER) {
                     for (AclRule rule : aclStore.getAclRules()) {
@@ -265,6 +265,14 @@ public class AclManager implements AclService {
         TrafficTreatment.Builder treatment = DefaultTrafficTreatment.builder();
         FlowEntry.Builder flowEntry = DefaultFlowEntry.builder();
 
+        if (rule.srcMac() != null) {
+            selectorBuilder.matchEthSrc(rule.srcMac());
+
+        }
+        if (rule.dstMac() != null) {
+            selectorBuilder.matchEthDst(rule.dstMac());
+        }
+
         selectorBuilder.matchEthType(Ethernet.TYPE_IPV4);
         if (rule.srcIp() != null) {
             selectorBuilder.matchIPSrc(rule.srcIp());
@@ -276,6 +284,9 @@ public class AclManager implements AclService {
         }
         if (rule.ipProto() != 0) {
             selectorBuilder.matchIPProtocol(Integer.valueOf(rule.ipProto()).byteValue());
+        }
+        if (rule.dscp() != 0) {
+            selectorBuilder.matchIPDscp(Byte.valueOf(rule.dscp()));
         }
         if (rule.dstTpPort() != 0) {
             switch (rule.ipProto()) {
@@ -289,6 +300,20 @@ public class AclManager implements AclService {
                     break;
             }
         }
+
+        if (rule.srcTpPort() != 0) {
+            switch (rule.ipProto()) {
+                case IPv4.PROTOCOL_TCP:
+                    selectorBuilder.matchTcpSrc(TpPort.tpPort(rule.srcTpPort()));
+                    break;
+                case IPv4.PROTOCOL_UDP:
+                    selectorBuilder.matchUdpSrc(TpPort.tpPort(rule.srcTpPort()));
+                    break;
+                default:
+                    break;
+            }
+        }
+
         if (rule.action() == AclRule.Action.ALLOW) {
             treatment.add(Instructions.createOutput(PortNumber.CONTROLLER));
         }

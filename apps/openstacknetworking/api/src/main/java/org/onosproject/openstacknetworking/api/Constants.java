@@ -15,7 +15,10 @@
  */
 package org.onosproject.openstacknetworking.api;
 
+import com.google.common.collect.ImmutableMap;
 import org.onlab.packet.MacAddress;
+
+import java.util.Map;
 
 /**
  * Provides constants used in OpenStackSwitching.
@@ -35,6 +38,18 @@ public final class Constants {
     public static final MacAddress DEFAULT_GATEWAY_MAC = MacAddress.valueOf(DEFAULT_GATEWAY_MAC_STR);
     public static final MacAddress DEFAULT_EXTERNAL_ROUTER_MAC = MacAddress.valueOf("fe:00:00:00:00:01");
 
+    private static final String CAVIUM_PCI_VENDOR_INFO = "177d:9712";
+    private static final String PORT_NAME_PREFIX_CAVIUM = "enp";
+    public static final String PCI_VENDOR_INFO = "pci_vendor_info";
+    public static final String DIRECT = "direct";
+    public static final String PCISLOT = "pci_slot";
+
+    private static final Map<String, String> PORT_NAME_PREFIX_MAP = createPortNamePrefixMap();
+    private static Map<String, String> createPortNamePrefixMap() {
+        //Additional pci vendor information will be added
+        return ImmutableMap.of(CAVIUM_PCI_VENDOR_INFO, PORT_NAME_PREFIX_CAVIUM);
+    }
+
     public static final int PRIORITY_TUNNEL_TAG_RULE = 30000;
     public static final int PRIORITY_FLOATING_INTERNAL = 42000;
     public static final int PRIORITY_FLOATING_EXTERNAL = 41000;
@@ -42,10 +57,13 @@ public final class Constants {
     public static final int PRIORITY_ICMP_RULE = 43000;
     public static final int PRIORITY_INTERNAL_ROUTING_RULE = 28000;
     public static final int PRIORITY_EXTERNAL_ROUTING_RULE = 25000;
-    public static final int PRIORITY_EXTERNAL_FLOATING_ROUTING_RULE = 26000;
+    public static final int PRIORITY_EXTERNAL_FLOATING_ROUTING_RULE = 27000;
     public static final int PRIORITY_SNAT_RULE = 26000;
     public static final int PRIORITY_SWITCHING_RULE = 30000;
-    public static final int PRIORITY_FLAT_RULE = 41000;
+    public static final int PRIORITY_FLAT_JUMP_UPSTREAM_RULE = 41000;
+    public static final int PRIORITY_FLAT_JUMP_DOWNSTREAM_RULE = 41000;
+    public static final int PRIORITY_FLAT_UPSTREAM_RULE = 41000;
+    public static final int PRIORITY_FLAT_DOWNSTREAM_RULE = 42000;
     public static final int PRIORITY_DHCP_RULE = 42000;
     public static final int PRIORITY_ADMIN_RULE = 32000;
     public static final int PRIORITY_ACL_RULE = 31000;
@@ -58,13 +76,33 @@ public final class Constants {
     public static final int PRIORITY_ARP_REPLY_RULE = 40000;
     public static final int PRIORITY_ARP_REQUEST_RULE = 40000;
 
-    public static final int DHCP_ARP_TABLE = 0;
-    public static final int SRC_VNI_TABLE = 0;
-    public static final int ACL_TABLE = 1;
-    public static final int CT_TABLE = 2;
-    public static final int JUMP_TABLE = 3;
-    public static final int ROUTING_TABLE = 4;
-    public static final int FORWARDING_TABLE = 5;
+    // flow table index
+    public static final int STAT_INBOUND_TABLE = 0;
+    public static final int VTAP_INBOUND_TABLE = 1;
+    public static final int VTAP_INBOUND_MIRROR_TABLE = 2;
+    public static final int STAT_FLAT_OUTBOUND_TABLE = 10;
+    public static final int VTAP_FLAT_OUTBOUND_TABLE = 11;
+    public static final int VTAP_FLAT_OUTBOUND_MIRROR_TABLE = 12;
+    public static final int DHCP_ARP_TABLE = 5;
+    public static final int FLAT_TABLE = 20;
+    public static final int VTAG_TABLE = 30;
+    public static final int ACL_TABLE = 40;
+    public static final int CT_TABLE = 41;
+    public static final int JUMP_TABLE = 50;
+    public static final int ROUTING_TABLE = 60;
+    public static final int STAT_OUTBOUND_TABLE = 70;
+    public static final int VTAP_OUTBOUND_TABLE = 71;
+    public static final int VTAP_OUTBOUND_MIRROR_TABLE = 72;
+    public static final int FORWARDING_TABLE = 80;
     public static final int GW_COMMON_TABLE = 0;
-    public static final int ERROR_TABLE = 10;
+    public static final int ERROR_TABLE = 100;
+
+    // group table index
+    public static final int VTAP_INBOUND_GROUP_TABLE = 1;
+    public static final int VTAP_FLAT_OUTBOUND_GROUP_TABLE = 2;
+    public static final int VTAP_OUTBOUND_GROUP_TABLE = 3;
+
+    public static Map<String, String> portNamePrefixMap() {
+        return PORT_NAME_PREFIX_MAP;
+    }
 }

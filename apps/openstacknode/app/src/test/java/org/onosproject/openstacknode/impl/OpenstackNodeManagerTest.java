@@ -29,10 +29,12 @@ import org.onosproject.core.CoreServiceAdapter;
 import org.onosproject.core.DefaultApplicationId;
 import org.onosproject.event.Event;
 import org.onosproject.net.Device;
+import org.onosproject.openstacknode.api.DefaultOpenstackNode;
 import org.onosproject.openstacknode.api.NodeState;
 import org.onosproject.openstacknode.api.OpenstackNode;
 import org.onosproject.openstacknode.api.OpenstackNodeEvent;
 import org.onosproject.openstacknode.api.OpenstackNodeListener;
+import org.onosproject.openstacknode.api.OpenstackNodeTest;
 import org.onosproject.store.service.TestStorageService;
 
 import java.util.List;
@@ -119,6 +121,7 @@ public class OpenstackNodeManagerTest extends OpenstackNodeTest {
         osNodeStore.createNode(GATEWAY_1);
 
         target = new org.onosproject.openstacknode.impl.OpenstackNodeManager();
+        target.storageService = new TestStorageService();
         target.coreService = new TestCoreService();
         target.clusterService = new TestClusterService();
         target.leadershipService = new TestLeadershipService();

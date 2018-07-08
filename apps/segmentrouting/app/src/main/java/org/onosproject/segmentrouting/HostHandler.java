@@ -27,8 +27,8 @@ import org.onosproject.net.Host;
 import org.onosproject.net.HostLocation;
 import org.onosproject.net.PortNumber;
 import org.onosproject.net.host.HostEvent;
-import org.onosproject.net.host.HostLocationProbingService.ProbeMode;
 import org.onosproject.net.host.HostService;
+import org.onosproject.net.host.ProbeMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -114,7 +114,10 @@ public class HostHandler {
                 srManager.getPairLocalPort(pairDeviceId).ifPresent(pairRemotePort -> {
                     // NOTE: Since the pairLocalPort is trunk port, use assigned vlan of original port
                     //       when the host is untagged
-                    VlanId vlanId = Optional.ofNullable(srManager.getInternalVlanId(location)).orElse(hostVlanId);
+                    VlanId vlanId = vlanForPairPort(hostVlanId, location);
+                    if (vlanId == null) {
+                        return;
+                    }
 
                     processBridgingRule(pairDeviceId, pairRemotePort, hostMac, vlanId, false);
                     ips.forEach(ip -> processRoutingRule(pairDeviceId, pairRemotePort, hostMac, vlanId,
@@ -158,13 +161,26 @@ public class HostHandler {
             if (pairDeviceId.isPresent() && pairLocalPort.isPresent()) {
                 // NOTE: Since the pairLocalPort is trunk port, use assigned vlan of original port
                 //       when the host is untagged
-                VlanId vlanId = Optional.ofNullable(srManager.getInternalVlanId(location)).orElse(hostVlanId);
+                VlanId vlanId = vlanForPairPort(hostVlanId, location);
+                if (vlanId == null) {
+                    return;
+                }
 
                 processBridgingRule(pairDeviceId.get(), pairLocalPort.get(), hostMac, vlanId, true);
                 ips.forEach(ip ->
                         processRoutingRule(pairDeviceId.get(), pairLocalPort.get(), hostMac, vlanId,
                                 ip, true));
             }
+
+            // Delete prefix from sr-device-subnet when the next hop host is removed
+            srManager.routeService.getRouteTables().forEach(tableId -> {
+                srManager.routeService.getRoutes(tableId).forEach(routeInfo -> {
+                    if (routeInfo.allRoutes().stream().anyMatch(rr -> ips.contains(rr.nextHop()))) {
+                        log.debug("HostRemoved. removeSubnet {}, {}", location, routeInfo.prefix());
+                        srManager.deviceConfiguration.removeSubnet(location, routeInfo.prefix());
+                    }
+                });
+            });
         });
     }
 
@@ -185,6 +201,9 @@ public class HostHandler {
 
         // For each old location
         Sets.difference(prevLocations, newLocations).forEach(prevLocation -> {
+            // First of all, verify each old location
+            srManager.probingService.probeHost(host, prevLocation, ProbeMode.VERIFY);
+
             // Remove routing rules for old IPs
             Sets.difference(prevIps, newIps).forEach(ip -> {
                 if (doubleTaggedHost) {
@@ -359,7 +378,10 @@ public class HostHandler {
                     srManager.getPairLocalPort(pairDeviceId).ifPresent(pairRemotePort -> {
                         // NOTE: Since the pairLocalPort is trunk port, use assigned vlan of original port
                         //       when the host is untagged
-                        VlanId vlanId = Optional.ofNullable(srManager.getInternalVlanId(location)).orElse(hostVlanId);
+                        VlanId vlanId = vlanForPairPort(hostVlanId, location);
+                        if (vlanId == null) {
+                            return;
+                        }
 
                         ipsToRemove.forEach(ip ->
                                 processRoutingRule(pairDeviceId, pairRemotePort, hostMac, vlanId, ip, true)
@@ -392,7 +414,7 @@ public class HostHandler {
             srManager.getPairDeviceId(cp.deviceId())
                     .ifPresent(pairDeviceId -> srManager.hostService.getConnectedHosts(pairDeviceId).stream()
                             .filter(host -> isHostInVlanOfPort(host, pairDeviceId, cp))
-                            .forEach(host -> srManager.probingService.probeHostLocation(host, cp, ProbeMode.DISCOVER))
+                            .forEach(host -> srManager.probingService.probeHost(host, cp, ProbeMode.DISCOVER))
                     );
         }
     }
@@ -435,7 +457,7 @@ public class HostHandler {
                 .filter(i -> !i.connectPoint().port().equals(pairRemotePort))
                 .forEach(i -> {
                     log.debug("Probing host {} on pair device {}", host.id(), i.connectPoint());
-                    srManager.probingService.probeHostLocation(host, i.connectPoint(), ProbeMode.DISCOVER);
+                    srManager.probingService.probeHost(host, i.connectPoint(), ProbeMode.DISCOVER);
                 });
     }
 
@@ -519,6 +541,28 @@ public class HostHandler {
         } else {
             srManager.defaultRoutingHandler.populateDoubleTaggedRoute(
                     deviceId, ip.toIpPrefix(), mac, innerVlan, outerVlan, outerTpid, port);
+        }
+    }
+
+    /**
+     * Returns VLAN ID to be used to program redirection flow on pair port.
+     *
+     * @param hostVlanId host VLAN ID
+     * @param location host location
+     * @return VLAN ID to be used; Or null if host VLAN does not match the interface config
+     */
+    VlanId vlanForPairPort(VlanId hostVlanId, ConnectPoint location) {
+        VlanId internalVlan = srManager.getInternalVlanId(location);
+        Set<VlanId> taggedVlan = srManager.interfaceService.getTaggedVlanId(location);
+
+        if (!hostVlanId.equals(VlanId.NONE) && taggedVlan.contains(hostVlanId)) {
+            return hostVlanId;
+        } else if (hostVlanId.equals(VlanId.NONE) && internalVlan != null) {
+            return internalVlan;
+        } else {
+            log.warn("VLAN mismatch. hostVlan={}, location={}, internalVlan={}, taggedVlan={}",
+                    hostVlanId, location, internalVlan, taggedVlan);
+            return null;
         }
     }
 

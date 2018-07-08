@@ -17,7 +17,7 @@
 package org.onosproject.buckdaemon;
 
 /**
- * Abstraction of a Buck task that can be spawned by the Buck daemon
+ * Abstraction of a Buck task that can be spawned by the Buck daemon.
  */
 public interface BuckTask {
 

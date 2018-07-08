@@ -54,7 +54,14 @@ import org.onlab.util.Tools;
 import org.onosproject.cfg.ComponentConfigService;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
-import org.onosproject.net.host.HostLocationProbingService;
+import org.onosproject.net.config.ConfigFactory;
+import org.onosproject.net.config.NetworkConfigEvent;
+import org.onosproject.net.config.NetworkConfigListener;
+import org.onosproject.net.config.NetworkConfigRegistry;
+import org.onosproject.net.config.NetworkConfigService;
+import org.onosproject.net.config.basics.BasicHostConfig;
+import org.onosproject.net.config.basics.HostLearningConfig;
+import org.onosproject.net.config.basics.SubjectFactories;
 import org.onosproject.net.intf.InterfaceService;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.Device;
@@ -93,12 +100,9 @@ import java.util.Dictionary;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.Set;
 
-import static java.util.concurrent.Executors.newScheduledThreadPool;
 import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 import static org.onlab.util.Tools.groupedThreads;
 import static org.slf4j.LoggerFactory.getLogger;
@@ -109,7 +113,7 @@ import static org.slf4j.LoggerFactory.getLogger;
  */
 @Component(immediate = true)
 @Service
-public class HostLocationProvider extends AbstractProvider implements HostProvider, HostLocationProbingService {
+public class HostLocationProvider extends AbstractProvider implements HostProvider {
     private final Logger log = getLogger(getClass());
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
@@ -134,12 +138,14 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
     protected ComponentConfigService cfgService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected InterfaceService interfaceService;
+    protected NetworkConfigRegistry registry;
 
-    private HostProviderService providerService;
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected InterfaceService interfaceService;
 
     private final InternalHostProvider processor = new InternalHostProvider();
     private final DeviceListener deviceListener = new InternalDeviceListener();
+    private final InternalConfigListener cfgListener = new InternalConfigListener();
 
     private ApplicationId appId;
 
@@ -173,10 +179,24 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
             label = "Allow hosts to be multihomed")
     private boolean multihomingEnabled = false;
 
-    private int probeInitDelayMs = 1000;
+    private HostProviderService providerService;
 
-    ExecutorService eventHandler;
-    private ScheduledExecutorService hostProber;
+    ExecutorService deviceEventHandler;
+    private ExecutorService probeEventHandler;
+    private ExecutorService packetHandler;
+
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected NetworkConfigService netcfgService;
+
+    private ConfigFactory<ConnectPoint, HostLearningConfig> hostLearningConfig =
+            new ConfigFactory<ConnectPoint, HostLearningConfig>(
+                    SubjectFactories.CONNECT_POINT_SUBJECT_FACTORY,
+                    HostLearningConfig.class, "hostLearning") {
+                @Override
+                public HostLearningConfig createConfig() {
+                    return new HostLearningConfig();
+                }
+            };
 
     /**
      * Creates an OpenFlow host provider.
@@ -189,13 +209,18 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
     public void activate(ComponentContext context) {
         cfgService.registerProperties(getClass());
         appId = coreService.registerApplication("org.onosproject.provider.host");
-        eventHandler = newSingleThreadScheduledExecutor(groupedThreads("onos/host-loc-provider", "event-handler", log));
-        hostProber = newScheduledThreadPool(32, groupedThreads("onos/host-loc-probe", "%d", log));
+        deviceEventHandler = newSingleThreadScheduledExecutor(groupedThreads("onos/host-loc-provider",
+                "device-event-handler", log));
+        probeEventHandler = newSingleThreadScheduledExecutor(groupedThreads("onos/host-loc-provider",
+                "probe-event-handler", log));
+        packetHandler = newSingleThreadScheduledExecutor(groupedThreads("onos/host-loc-provider",
+                "packet-handler", log));
         providerService = providerRegistry.register(this);
         packetService.addProcessor(processor, PacketProcessor.advisor(1));
         deviceService.addListener(deviceListener);
-
+        registry.registerConfigFactory(hostLearningConfig);
         modified(context);
+        netcfgService.addListener(cfgListener);
 
         log.info("Started with Application ID {}", appId.id());
     }
@@ -209,9 +234,12 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
         providerRegistry.unregister(this);
         packetService.removeProcessor(processor);
         deviceService.removeListener(deviceListener);
-        eventHandler.shutdown();
-        hostProber.shutdown();
+        deviceEventHandler.shutdown();
+        probeEventHandler.shutdown();
+        packetHandler.shutdown();
         providerService = null;
+        registry.unregisterConfigFactory(hostLearningConfig);
+        netcfgService.removeListener(cfgListener);
         log.info("Stopped");
     }
 
@@ -350,47 +378,6 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
     }
 
     @Override
-    public void probeHostLocation(Host host, ConnectPoint connectPoint, ProbeMode probeMode) {
-        host.ipAddresses().stream().findFirst().ifPresent(ip -> {
-            MacAddress probeMac = providerService.addPendingHostLocation(host.id(), connectPoint, probeMode);
-            log.debug("Constructing {} probe for host {} with {}", probeMode, host.id(), ip);
-            Ethernet probe;
-            if (ip.isIp4()) {
-                probe = ARP.buildArpRequest(probeMac.toBytes(), Ip4Address.ZERO.toOctets(),
-                        host.id().mac().toBytes(), ip.toOctets(),
-                        host.id().mac().toBytes(), host.id().vlanId().toShort());
-            } else {
-                probe = NeighborSolicitation.buildNdpSolicit(
-                        ip.getIp6Address(),
-                        Ip6Address.valueOf(IPv6.getLinkLocalAddress(probeMac.toBytes())),
-                        ip.getIp6Address(),
-                        probeMac,
-                        host.id().mac(),
-                        host.id().vlanId());
-            }
-
-            // NOTE: delay the probe a little bit to wait for the store synchronization is done
-            hostProber.schedule(() ->
-                    sendLocationProbe(probe, connectPoint), probeInitDelayMs, TimeUnit.MILLISECONDS);
-        });
-    }
-
-    /**
-     * Send the probe packet on given port.
-     *
-     * @param probe the probe packet
-     * @param connectPoint the port we want to probe
-     */
-    private void sendLocationProbe(Ethernet probe, ConnectPoint connectPoint) {
-        log.info("Sending probe for host {} on location {} with probeMac {}",
-                probe.getDestinationMAC(), connectPoint, probe.getSourceMAC());
-        TrafficTreatment treatment = DefaultTrafficTreatment.builder().setOutput(connectPoint.port()).build();
-        OutboundPacket outboundPacket = new DefaultOutboundPacket(connectPoint.deviceId(),
-                treatment, ByteBuffer.wrap(probe.serialize()));
-        packetService.emit(outboundPacket);
-    }
-
-    @Override
     public void triggerProbe(Host host) {
         //log.info("Triggering probe on device {} ", host);
 
@@ -461,10 +448,8 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
 
                     if (prevLocations.stream().noneMatch(loc -> loc.deviceId().equals(hloc.deviceId()))) {
                         // New location is on a device that we haven't seen before
-                        // Could be a dual-home host. Append new location and send out the probe
+                        // Could be a dual-home host.
                         newLocations.addAll(prevLocations);
-                        prevLocations.forEach(prevLocation ->
-                                probeHostLocation(existingHost, prevLocation, ProbeMode.VERIFY));
                     } else {
                         // Move within the same switch
                         // Simply replace old location that is on the same device
@@ -510,6 +495,10 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
 
         @Override
         public void process(PacketContext context) {
+            packetHandler.execute(() -> processPacketInternal(context));
+        }
+
+        private void processPacketInternal(PacketContext context) {
             if (context == null) {
                 return;
             }
@@ -551,10 +540,15 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
             HostId hid = HostId.hostId(eth.getSourceMAC(), vlan);
             MacAddress destMac = eth.getDestinationMAC();
 
-            // Receives a location probe. Invalid entry from the cache
+            // Ignore location probes
             if (multihomingEnabled && destMac.isOnos() && !MacAddress.NONE.equals(destMac)) {
-                log.info("Receives probe for {}/{} on {}", srcMac, vlan, heardOn);
-                providerService.removePendingHostLocation(destMac);
+                return;
+            }
+
+            HostLearningConfig cfg = netcfgService.getConfig(heardOn, HostLearningConfig.class);
+            // if learning is disabled bail out.
+            if ((cfg != null) && (!cfg.hostLearningEnabled())) {
+                log.debug("Learning disabled for {}, abort.", heardOn);
                 return;
             }
 
@@ -754,7 +748,7 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
     private class InternalDeviceListener implements DeviceListener {
         @Override
         public void event(DeviceEvent event) {
-            eventHandler.execute(() -> handleEvent(event));
+            deviceEventHandler.execute(() -> handleEvent(event));
         }
 
         private void handleEvent(DeviceEvent event) {
@@ -816,4 +810,45 @@ public class HostLocationProvider extends AbstractProvider implements HostProvid
         );
     }
 
+
+    private class InternalConfigListener implements NetworkConfigListener {
+
+        @Override
+        public void event(NetworkConfigEvent event) {
+            switch (event.type()) {
+                case CONFIG_ADDED:
+                case CONFIG_UPDATED:
+                    log.debug("HostLearningConfig event of type  {}", event.type());
+                    // if learning enabled do nothing
+                    HostLearningConfig learningConfig = (HostLearningConfig) event.config().get();
+                    if (learningConfig.hostLearningEnabled()) {
+                        return;
+                    }
+
+                    // if host learning is disable remove this location from existing, learnt hosts
+                    ConnectPoint connectPoint = learningConfig.subject();
+                    Set<Host> connectedHosts = hostService.getConnectedHosts(connectPoint);
+                    for (Host host : connectedHosts) {
+                        BasicHostConfig hostConfig = netcfgService.getConfig(host.id(), BasicHostConfig.class);
+
+                        if ((hostConfig == null) || (!hostConfig.locations().contains(connectPoint))) {
+                            // timestamp shoud not matter for comparing HostLocation and ConnectPoint
+                            providerService.removeLocationFromHost(host.id(), new HostLocation(connectPoint, 1));
+                        }
+                    }
+                    break;
+                case CONFIG_REMOVED:
+                default:
+                    break;
+            }
+        }
+
+        @Override
+        public boolean isRelevant(NetworkConfigEvent event) {
+            if (!event.configClass().equals(HostLearningConfig.class)) {
+                return false;
+            }
+            return true;
+        }
+    }
 }

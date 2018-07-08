@@ -97,6 +97,8 @@
         <module>evpn-route-service</module>
         <module>l3vpn</module>
         <module>openstacknetworkingui</module>
+        <module>openstacktelemetry</module>
+        <module>openstackvtap</module>
         <module>cfm</module>
         <module>routeradvertisement</module>
         <module>simplefabric</module>
@@ -105,6 +107,8 @@
         <module>layout</module>
         <module>imr</module>
         <module>t3</module>
+        <module>nodemetrics</module>
+        <module>inbandtelemetry</module>
     </modules>
 
     <properties>

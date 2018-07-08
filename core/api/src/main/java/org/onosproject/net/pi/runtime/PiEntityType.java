@@ -41,5 +41,10 @@ public enum PiEntityType {
     /**
      * Meter config.
      */
-    METER_CELL_CONFIG
+    METER_CELL_CONFIG,
+
+    /**
+     * Register entry.
+     */
+    REGISTER_CELL
 }

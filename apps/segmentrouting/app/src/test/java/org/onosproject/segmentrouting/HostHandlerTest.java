@@ -21,6 +21,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
+import org.easymock.EasyMock;
 import org.junit.Before;
 import org.junit.Test;
 import org.onlab.packet.IpAddress;
@@ -28,7 +29,7 @@ import org.onlab.packet.IpPrefix;
 import org.onlab.packet.MacAddress;
 import org.onlab.packet.VlanId;
 import org.onosproject.net.config.ConfigApplyDelegate;
-import org.onosproject.net.host.HostLocationProbingService;
+import org.onosproject.net.host.ProbeMode;
 import org.onosproject.net.intf.Interface;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.DefaultHost;
@@ -42,6 +43,11 @@ import org.onosproject.net.flow.TrafficTreatment;
 import org.onosproject.net.host.HostEvent;
 import org.onosproject.net.host.InterfaceIpAddress;
 import org.onosproject.net.provider.ProviderId;
+import org.onosproject.routeservice.ResolvedRoute;
+import org.onosproject.routeservice.Route;
+import org.onosproject.routeservice.RouteInfo;
+import org.onosproject.routeservice.RouteService;
+import org.onosproject.routeservice.RouteTableId;
 import org.onosproject.segmentrouting.config.DeviceConfiguration;
 import org.onosproject.segmentrouting.config.SegmentRoutingDeviceConfig;
 import org.onosproject.store.service.StorageService;
@@ -51,8 +57,12 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.easymock.EasyMock.createMock;
+import static org.easymock.EasyMock.createNiceMock;
 import static org.easymock.EasyMock.expect;
+import static org.easymock.EasyMock.expectLastCall;
 import static org.easymock.EasyMock.replay;
+import static org.easymock.EasyMock.reset;
+import static org.easymock.EasyMock.verify;
 import static org.junit.Assert.*;
 
 /**r
@@ -123,7 +133,8 @@ public class HostHandlerTest {
     private static final HostLocation HOST_LOC61 = new HostLocation(CP61, 0);
     // Interface VLAN
     private static final VlanId INTF_VLAN_UNTAGGED = VlanId.vlanId((short) 10);
-    private static final Set<VlanId> INTF_VLAN_TAGGED = Sets.newHashSet(VlanId.vlanId((short) 20));
+    private static final VlanId INTF_VLAN_TAGGED_1 = VlanId.vlanId((short) 20);
+    private static final Set<VlanId> INTF_VLAN_TAGGED = Sets.newHashSet(INTF_VLAN_TAGGED_1);
     private static final VlanId INTF_VLAN_NATIVE = VlanId.vlanId((short) 30);
     private static final Set<VlanId> INTF_VLAN_PAIR = Sets.newHashSet(VlanId.vlanId((short) 10),
             VlanId.vlanId((short) 20), VlanId.vlanId((short) 30));
@@ -182,7 +193,7 @@ public class HostHandlerTest {
     private static final Set<Interface> INTERFACES = Sets.newHashSet(INTF11, INTF12, INTF13, INTF21,
             INTF22, INTF31, INTF32, INTF39, INTF41, INTF49);
 
-    private MockLocationProbingService mockLocationProbingService;
+    private MockHostProbingService mockLocationProbingService;
 
     @Before
     public void setUp() throws Exception {
@@ -218,9 +229,14 @@ public class HostHandlerTest {
         srManager.mastershipService = new MockMastershipService(LOCAL_DEVICES);
         srManager.hostService = new MockHostService(HOSTS);
         srManager.cfgService = mockNetworkConfigRegistry;
-        mockLocationProbingService = new MockLocationProbingService();
+        mockLocationProbingService = new MockHostProbingService();
         srManager.probingService = mockLocationProbingService;
         srManager.linkHandler = new MockLinkHandler(srManager);
+
+        // Not important for most of the HostHandler test case. Simply return an empty set here
+        srManager.routeService = createNiceMock(RouteService.class);
+        expect(srManager.routeService.getRouteTables()).andReturn(Sets.newHashSet()).anyTimes();
+        replay(srManager.routeService);
 
         hostHandler = new HostHandler(srManager);
 
@@ -351,7 +367,7 @@ public class HostHandlerTest {
         assertEquals(P1, BRIDGING_TABLE.get(new MockBridgingTableKey(DEV3, HOST_MAC, INTF_VLAN_UNTAGGED)).portNumber);
         assertEquals(P9, BRIDGING_TABLE.get(new MockBridgingTableKey(DEV4, HOST_MAC, INTF_VLAN_UNTAGGED)).portNumber);
         // Expect probe to be sent out on pair device
-        assertTrue(mockLocationProbingService.verifyProbe(host1, CP41, HostLocationProbingService.ProbeMode.DISCOVER));
+        assertTrue(mockLocationProbingService.verifyProbe(host1, CP41, ProbeMode.DISCOVER));
 
         // Add the second location of dual-homed host
         // Expect: no longer use the pair link
@@ -753,7 +769,7 @@ public class HostHandlerTest {
         assertEquals(P1, BRIDGING_TABLE.get(new MockBridgingTableKey(DEV3, HOST_MAC, INTF_VLAN_UNTAGGED)).portNumber);
         assertEquals(P9, BRIDGING_TABLE.get(new MockBridgingTableKey(DEV4, HOST_MAC, INTF_VLAN_UNTAGGED)).portNumber);
         // Expect probe to be sent out on pair device
-        assertTrue(mockLocationProbingService.verifyProbe(host2, CP41, HostLocationProbingService.ProbeMode.DISCOVER));
+        assertTrue(mockLocationProbingService.verifyProbe(host2, CP41, ProbeMode.DISCOVER));
 
         // Discover location
         // Expect: cancel all redirections
@@ -854,5 +870,68 @@ public class HostHandlerTest {
         assertEquals(2, BRIDGING_TABLE.size());
         assertNotNull(BRIDGING_TABLE.get(new MockBridgingTableKey(DEV1, HOST_MAC, INTF_VLAN_UNTAGGED)));
         assertNotNull(BRIDGING_TABLE.get(new MockBridgingTableKey(DEV2, HOST_MAC, INTF_VLAN_UNTAGGED)));
+    }
+
+    @Test
+    public void testVlanForPairPort() {
+        assertEquals(INTF_VLAN_UNTAGGED, hostHandler.vlanForPairPort(VlanId.NONE, CP11));
+        assertEquals(INTF_VLAN_NATIVE, hostHandler.vlanForPairPort(VlanId.NONE, CP13));
+        assertEquals(INTF_VLAN_TAGGED_1, hostHandler.vlanForPairPort(INTF_VLAN_TAGGED_1, CP13));
+        assertNull(hostHandler.vlanForPairPort(INTF_VLAN_UNTAGGED, CP11));
+        assertNull(hostHandler.vlanForPairPort(INTF_VLAN_UNTAGGED, CP13));
+        assertNull(hostHandler.vlanForPairPort(VlanId.NONE, CP51));
+        assertNull(hostHandler.vlanForPairPort(INTF_VLAN_UNTAGGED, CP51));
+    }
+
+    @Test
+    public void testHostRemovedWithRouteRemoved() throws Exception {
+        Host subject = new DefaultHost(PROVIDER_ID, HOST_ID_UNTAGGED, HOST_MAC, HOST_VLAN_UNTAGGED,
+                Sets.newHashSet(HOST_LOC11), Sets.newHashSet(HOST_IP11), false);
+
+        // Add a host
+        // Expect: add one routing rule and one bridging rule
+        hostHandler.processHostAddedEvent(new HostEvent(HostEvent.Type.HOST_ADDED, subject));
+        assertEquals(1, ROUTING_TABLE.size());
+        assertNotNull(ROUTING_TABLE.get(new MockRoutingTableKey(DEV1, HOST_IP11.toIpPrefix())));
+        assertEquals(1, BRIDGING_TABLE.size());
+        assertNotNull(BRIDGING_TABLE.get(new MockBridgingTableKey(DEV1, HOST_MAC, INTF_VLAN_UNTAGGED)));
+
+        IpPrefix prefix = IpPrefix.valueOf("55.55.55.0/24");
+
+        // Setting up mock route service
+        RouteService routeService = hostHandler.srManager.routeService;
+        reset(routeService);
+
+        IpAddress nextHopIp2 = IpAddress.valueOf("20.0.0.1");
+        MacAddress nextHopMac2 = MacAddress.valueOf("00:22:33:44:55:66");
+        VlanId nextHopVlan2 = VlanId.NONE;
+
+        Route r1 = new Route(Route.Source.STATIC, prefix, HOST_IP11);
+        ResolvedRoute rr1 = new ResolvedRoute(r1, HOST_MAC, VlanId.NONE);
+        Route r2 = new Route(Route.Source.STATIC, prefix, nextHopIp2);
+        ResolvedRoute rr2 = new ResolvedRoute(r2, nextHopMac2, nextHopVlan2);
+        RouteInfo routeInfo = new RouteInfo(prefix, rr1, Sets.newHashSet(rr1, rr2));
+        RouteTableId routeTableId = new RouteTableId("ipv4");
+
+        expect(routeService.getRouteTables()).andReturn(Sets.newHashSet(routeTableId));
+        expect(routeService.getRoutes(routeTableId)).andReturn(Sets.newHashSet(routeInfo));
+        replay(routeService);
+
+        // Setting up mock device configuration
+        hostHandler.srManager.deviceConfiguration = EasyMock.createNiceMock(DeviceConfiguration.class);
+        DeviceConfiguration deviceConfiguration = hostHandler.srManager.deviceConfiguration;
+        expect(deviceConfiguration.inSameSubnet(CP11, HOST_IP11)).andReturn(true);
+        deviceConfiguration.removeSubnet(CP11, prefix);
+        expectLastCall();
+        replay(deviceConfiguration);
+
+        // Remove the host
+        // Expect: add the routing rule and the bridging rule
+        hostHandler.processHostRemovedEvent(new HostEvent(HostEvent.Type.HOST_REMOVED, subject));
+        assertEquals(0, ROUTING_TABLE.size());
+        assertEquals(0, BRIDGING_TABLE.size());
+
+        // Expect: subnet is removed from device config
+        verify(deviceConfiguration);
     }
 }

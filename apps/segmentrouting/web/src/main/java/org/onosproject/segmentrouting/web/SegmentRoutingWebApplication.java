@@ -21,11 +21,15 @@ import org.onlab.rest.AbstractWebApplication;
 import java.util.Set;
 
 /**
- * Segment Routing Web application.
+ * Segment Routing REST API.
  */
 public class SegmentRoutingWebApplication extends AbstractWebApplication {
     @Override
     public Set<Class<?>> getClasses() {
-        return getClasses(PseudowireWebResource.class, McastWebResource.class);
+        return getClasses(
+                PseudowireWebResource.class,
+                McastWebResource.class,
+                XconnectWebResource.class
+        );
     }
 }

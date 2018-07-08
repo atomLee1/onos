@@ -17,6 +17,7 @@ package org.onosproject.openstacknetworking.impl;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
@@ -26,6 +27,7 @@ import org.apache.felix.scr.annotations.Service;
 import org.onlab.packet.ARP;
 import org.onlab.packet.Ethernet;
 import org.onlab.packet.IpAddress;
+import org.onlab.packet.IpPrefix;
 import org.onlab.packet.MacAddress;
 import org.onlab.packet.VlanId;
 import org.onlab.util.KryoNamespace;
@@ -51,9 +53,11 @@ import org.onosproject.store.serializers.KryoNamespaces;
 import org.onosproject.store.service.ConsistentMap;
 import org.onosproject.store.service.Serializer;
 import org.onosproject.store.service.StorageService;
+import org.openstack4j.model.common.IdEntity;
 import org.openstack4j.model.network.ExternalGateway;
 import org.openstack4j.model.network.IP;
 import org.openstack4j.model.network.Network;
+import org.openstack4j.model.network.NetworkType;
 import org.openstack4j.model.network.Port;
 import org.openstack4j.model.network.Router;
 import org.openstack4j.model.network.Subnet;
@@ -69,6 +73,10 @@ import java.util.stream.Collectors;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static org.onosproject.net.AnnotationKeys.PORT_NAME;
+import static org.onosproject.openstacknetworking.api.Constants.DIRECT;
+import static org.onosproject.openstacknetworking.api.Constants.PCISLOT;
+import static org.onosproject.openstacknetworking.api.Constants.portNamePrefixMap;
+import static org.onosproject.openstacknetworking.util.OpenstackNetworkingUtil.getIntfNameFromPciAddress;
 import static org.slf4j.LoggerFactory.getLogger;
 
 /**
@@ -105,6 +113,10 @@ public class OpenstackNetworkManager
     private static final String ERR_NOT_FOUND = " does not exist";
     private static final String ERR_IN_USE = " still in use";
     private static final String ERR_DUPLICATE = " already exists";
+    private static final String PORT_NAME_PREFIX_VM = "tap";
+
+    private static final int PREFIX_LENGTH = 32;
+
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected CoreService coreService;
@@ -312,11 +324,28 @@ public class OpenstackNetworkManager
         if (Strings.isNullOrEmpty(portName)) {
             return null;
         }
-        Optional<Port> osPort = osNetworkStore.ports()
-                .stream()
-                .filter(p -> p.getId().contains(portName.substring(3)))
-                .findFirst();
-        return osPort.orElse(null);
+
+        if (port.annotations().value(PORT_NAME).startsWith(PORT_NAME_PREFIX_VM)) {
+            Optional<Port> osPort = osNetworkStore.ports()
+                    .stream()
+                    .filter(p -> p.getId().contains(portName.substring(3)))
+                    .findFirst();
+            return osPort.orElse(null);
+        } else if (isDirectPort(portName)) {
+            //Additional prefixes will be added
+            Optional<Port> osPort = osNetworkStore.ports()
+                    .stream()
+                    .filter(p -> p.getvNicType().equals(DIRECT) && p.getProfile().get(PCISLOT) != null)
+                    .filter(p -> getIntfNameFromPciAddress(p).equals(portName))
+                    .findFirst();
+            return osPort.orElse(null);
+        } else {
+            return null;
+        }
+    }
+
+    private boolean isDirectPort(String portName) {
+        return portNamePrefixMap().values().stream().filter(p -> portName.startsWith(p)).findAny().isPresent();
     }
 
     @Override
@@ -330,6 +359,49 @@ public class OpenstackNetworkManager
                 .filter(port -> Objects.equals(port.getNetworkId(), netId))
                 .collect(Collectors.toSet());
         return ImmutableSet.copyOf(osPorts);
+    }
+
+    @Override
+    public Set<IpPrefix> getFixedIpsByNetworkType(String type) {
+        if (type == null) {
+            return Sets.newHashSet();
+        }
+
+        Set<Network> networks = osNetworkStore.networks();
+        Set<String> networkIds = Sets.newConcurrentHashSet();
+
+        switch (type.toUpperCase()) {
+            case "FLAT" :
+                networkIds = networks.stream()
+                        .filter(n -> n.getNetworkType() == NetworkType.FLAT)
+                        .map(IdEntity::getId).collect(Collectors.toSet());
+                break;
+            case "VXLAN" :
+                networkIds = networks.stream()
+                        .filter(n -> n.getNetworkType() == NetworkType.VXLAN)
+                        .map(IdEntity::getId).collect(Collectors.toSet());
+                break;
+            case "VLAN" :
+                networkIds = networks.stream()
+                        .filter(n -> n.getNetworkType() == NetworkType.VLAN)
+                        .map(IdEntity::getId).collect(Collectors.toSet());
+                break;
+            default:
+                break;
+        }
+
+        Set<IP> ips = Sets.newConcurrentHashSet();
+        for (String networkId : networkIds) {
+            osNetworkStore.ports()
+                    .stream()
+                    .filter(p -> p.getNetworkId().equals(networkId))
+                    .filter(p -> p.getFixedIps() != null)
+                    .forEach(p -> ips.addAll(p.getFixedIps()));
+        }
+
+        return ips.stream().map(ip -> IpPrefix.valueOf(
+                IpAddress.valueOf(ip.getIpAddress()), PREFIX_LENGTH))
+                .collect(Collectors.toSet());
     }
 
     @Override
@@ -393,19 +465,13 @@ public class OpenstackNetworkManager
             return;
         }
 
-        String upLinkPort = gatewayNode.uplinkPort();
-
-        org.onosproject.net.Port port = deviceService.getPorts(gatewayNode.intgBridge()).stream()
-                .filter(p -> Objects.equals(p.annotations().value(PORT_NAME), upLinkPort))
-                .findAny().orElse(null);
-
-        if (port == null) {
+        if (gatewayNode.uplinkPortNum() == null) {
             log.warn("There's no uplink port for gateway node {}", gatewayNode.toString());
             return;
         }
 
         TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                .setOutput(port.number())
+                .setOutput(gatewayNode.uplinkPortNum())
                 .build();
 
         packetService.emit(new DefaultOutboundPacket(
@@ -421,6 +487,10 @@ public class OpenstackNetworkManager
 
     @Override
     public void deleteExternalPeerRouter(ExternalGateway externalGateway) {
+        if (externalGateway == null) {
+            return;
+        }
+
         IpAddress targetIp = getExternalPeerRouterIp(externalGateway);
         if (targetIp == null) {
             return;
@@ -448,12 +518,12 @@ public class OpenstackNetworkManager
         try {
             externalPeerRouterMap.computeIfPresent(ipAddress.toString(), (id, existing) ->
                 new DefaultExternalPeerRouter(ipAddress, macAddress, existing.externalPeerRouterVlanId()));
+
+            log.info("Updated external peer router map {}",
+                    externalPeerRouterMap.get(ipAddress.toString()).value().toString());
         } catch (Exception e) {
             log.error("Exception occurred because of {}", e.toString());
         }
-
-        log.info("Updated external peer router map {}",
-                externalPeerRouterMap.get(ipAddress.toString()).value().toString());
     }
 
 
@@ -538,6 +608,9 @@ public class OpenstackNetworkManager
     }
 
     private IpAddress getExternalPeerRouterIp(ExternalGateway externalGateway) {
+        if (externalGateway == null) {
+            return null;
+        }
         Optional<Subnet> externalSubnet = subnets(externalGateway.getNetworkId())
                 .stream()
                 .findFirst();

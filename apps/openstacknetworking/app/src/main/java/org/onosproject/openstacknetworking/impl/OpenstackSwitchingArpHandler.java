@@ -86,7 +86,6 @@ import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_ARP_REQ
 import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_ARP_SUBNET_RULE;
 import static org.onosproject.openstacknetworking.util.RulePopulatorUtil.buildExtension;
 import static org.onosproject.openstacknode.api.OpenstackNode.NodeType.COMPUTE;
-import static org.onosproject.openstacknode.api.OpenstackNode.NodeType.GATEWAY;
 
 /**
  * Handles ARP packet from VMs.
@@ -137,7 +136,7 @@ public final class OpenstackSwitchingArpHandler {
     private String gatewayMac = DEFAULT_GATEWAY_MAC_STR;
 
     @Property(name = ARP_MODE, value = DEFAULT_ARP_MODE_STR,
-            label = "ARP processing mode, proxy (default) | broadcast ")
+            label = "ARP processing mode, broadcast | proxy (default)")
     protected String arpMode = DEFAULT_ARP_MODE_STR;
 
     private final InternalPacketProcessor packetProcessor = new InternalPacketProcessor();
@@ -297,6 +296,58 @@ public final class OpenstackSwitchingArpHandler {
     }
 
     /**
+     * Installs flow rules which convert ARP request packet into ARP reply
+     * by adding a fake gateway MAC address as Source Hardware Address.
+     *
+     * @param osSubnet  openstack subnet
+     * @param install   flag which indicates whether to install rule or remove rule
+     */
+    private void setFakeGatewayArpRule(Subnet osSubnet, boolean install, OpenstackNode osNode) {
+
+        if (arpMode.equals(ARP_BROADCAST_MODE)) {
+            String gateway = osSubnet.getGateway();
+
+            TrafficSelector selector = DefaultTrafficSelector.builder()
+                    .matchEthType(EthType.EtherType.ARP.ethType().toShort())
+                    .matchArpOp(ARP.OP_REQUEST)
+                    .matchArpTpa(Ip4Address.valueOf(gateway))
+                    .build();
+
+            TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                    .setArpOp(ARP.OP_REPLY)
+                    .setArpSha(MacAddress.valueOf(gatewayMac))
+                    .setArpSpa(Ip4Address.valueOf(gateway))
+                    .setOutput(PortNumber.IN_PORT)
+                    .build();
+
+            if (osNode == null) {
+                osNodeService.completeNodes(COMPUTE).forEach(n ->
+                        osFlowRuleService.setRule(
+                                appId,
+                                n.intgBridge(),
+                                selector,
+                                treatment,
+                                PRIORITY_ARP_GATEWAY_RULE,
+                                DHCP_ARP_TABLE,
+                                install
+                        )
+                );
+            } else {
+                osFlowRuleService.setRule(
+                        appId,
+                        osNode.intgBridge(),
+                        selector,
+                        treatment,
+                        PRIORITY_ARP_GATEWAY_RULE,
+                        DHCP_ARP_TABLE,
+                        install
+                );
+            }
+
+        }
+    }
+
+    /**
      * An internal packet processor which processes ARP request, and results in
      * packet-out ARP reply.
      */
@@ -356,11 +407,11 @@ public final class OpenstackSwitchingArpHandler {
                 case OPENSTACK_SUBNET_CREATED:
                 case OPENSTACK_SUBNET_UPDATED:
                     addSubnetGateway(event.subnet());
-                    setFakeGatewayArpRule(event.subnet(), true);
+                    setFakeGatewayArpRule(event.subnet(), true, null);
                     break;
                 case OPENSTACK_SUBNET_REMOVED:
                     removeSubnetGateway(event.subnet());
-                    setFakeGatewayArpRule(event.subnet(), false);
+                    setFakeGatewayArpRule(event.subnet(), false, null);
                     break;
                 case OPENSTACK_NETWORK_CREATED:
                 case OPENSTACK_NETWORK_UPDATED:
@@ -371,45 +422,6 @@ public final class OpenstackSwitchingArpHandler {
                 default:
                     // do nothing for the other events
                     break;
-            }
-        }
-
-        /**
-         * Installs flow rules which convert ARP request packet into ARP reply
-         * by adding a fake gateway MAC address as Source Hardware Address.
-         *
-         * @param osSubnet  openstack subnet
-         * @param install   flag which indicates whether to install rule or remove rule
-         */
-        private void setFakeGatewayArpRule(Subnet osSubnet, boolean install) {
-
-            if (arpMode.equals(ARP_BROADCAST_MODE)) {
-                String gateway = osSubnet.getGateway();
-
-                TrafficSelector selector = DefaultTrafficSelector.builder()
-                        .matchEthType(EthType.EtherType.ARP.ethType().toShort())
-                        .matchArpOp(ARP.OP_REQUEST)
-                        .matchArpTpa(Ip4Address.valueOf(gateway))
-                        .build();
-
-                TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                        .setArpOp(ARP.OP_REPLY)
-                        .setArpSha(MacAddress.valueOf(gatewayMac))
-                        .setArpSpa(Ip4Address.valueOf(gateway))
-                        .setOutput(PortNumber.IN_PORT)
-                        .build();
-
-                osNodeService.completeNodes(COMPUTE).forEach(n ->
-                    osFlowRuleService.setRule(
-                            appId,
-                            n.intgBridge(),
-                            selector,
-                            treatment,
-                            PRIORITY_ARP_GATEWAY_RULE,
-                            DHCP_ARP_TABLE,
-                            install
-                    )
-                );
             }
         }
     }
@@ -425,7 +437,7 @@ public final class OpenstackSwitchingArpHandler {
         public boolean isRelevant(OpenstackNodeEvent event) {
             // do not allow to proceed without leadership
             NodeId leader = leadershipService.getLeader(appId.name());
-            return Objects.equals(localNodeId, leader);
+            return Objects.equals(localNodeId, leader) && event.subject().type() == COMPUTE;
         }
 
         @Override
@@ -438,59 +450,75 @@ public final class OpenstackSwitchingArpHandler {
                 case OPENSTACK_NODE_INCOMPLETE:
                     setDefaultArpRule(osNode, false);
                     break;
-                case OPENSTACK_NODE_CREATED:
-                case OPENSTACK_NODE_UPDATED:
-                case OPENSTACK_NODE_REMOVED:
                 default:
                     break;
             }
         }
 
-        private void setDefaultArpRule(OpenstackNode openstackNode, boolean install) {
-            if (openstackNode.type().equals(GATEWAY)) {
-                return;
+        private void setDefaultArpRule(OpenstackNode osNode, boolean install) {
+            switch (arpMode) {
+                case ARP_PROXY_MODE:
+                    setDefaultArpRuleForProxyMode(osNode, install);
+                    break;
+                case ARP_BROADCAST_MODE:
+                    setDefaultArpRuleForBroadcastMode(osNode, install);
+
+                    // we do not add fake gateway ARP rules for FLAT network
+                    // ARP packets generated by FLAT typed VM should not be
+                    // delegated to switch to handle
+                    osNetworkService.subnets().stream().filter(subnet ->
+                            osNetworkService.network(subnet.getNetworkId()) != null &&
+                                    osNetworkService.network(subnet.getNetworkId())
+                                            .getNetworkType() == NetworkType.FLAT)
+                                            .forEach(subnet ->
+                        setFakeGatewayArpRule(subnet, install, osNode));
+                    break;
+                default:
+                    log.warn("Invalid ARP mode {}. Please use either " +
+                            "broadcast or proxy mode.", arpMode);
+                    break;
             }
+        }
 
-            if (arpMode.equals(ARP_PROXY_MODE)) {
-                TrafficSelector selector = DefaultTrafficSelector.builder()
-                        .matchEthType(EthType.EtherType.ARP.ethType().toShort())
-                        .build();
+        private void setDefaultArpRuleForProxyMode(OpenstackNode osNode, boolean install) {
+            TrafficSelector selector = DefaultTrafficSelector.builder()
+                    .matchEthType(EthType.EtherType.ARP.ethType().toShort())
+                    .build();
 
-                TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                        .punt()
-                        .build();
+            TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                    .punt()
+                    .build();
 
-                osFlowRuleService.setRule(
-                        appId,
-                        openstackNode.intgBridge(),
-                        selector,
-                        treatment,
-                        PRIORITY_ARP_CONTROL_RULE,
-                        DHCP_ARP_TABLE,
-                        install
-                );
-            } else if (arpMode.equals(ARP_BROADCAST_MODE)) {
-                TrafficSelector selector = DefaultTrafficSelector.builder()
-                        .matchEthType(EthType.EtherType.ARP.ethType().toShort())
-                        .matchArpOp(ARP.OP_REQUEST)
-                        .build();
+            osFlowRuleService.setRule(
+                    appId,
+                    osNode.intgBridge(),
+                    selector,
+                    treatment,
+                    PRIORITY_ARP_CONTROL_RULE,
+                    DHCP_ARP_TABLE,
+                    install
+            );
+        }
 
-                TrafficTreatment treatment = DefaultTrafficTreatment.builder()
-                        .setOutput(PortNumber.FLOOD)
-                        .build();
+        private void setDefaultArpRuleForBroadcastMode(OpenstackNode osNode, boolean install) {
+            TrafficSelector selector = DefaultTrafficSelector.builder()
+                    .matchEthType(EthType.EtherType.ARP.ethType().toShort())
+                    .matchArpOp(ARP.OP_REQUEST)
+                    .build();
 
-                osFlowRuleService.setRule(
-                        appId,
-                        openstackNode.intgBridge(),
-                        selector,
-                        treatment,
-                        PRIORITY_ARP_SUBNET_RULE,
-                        DHCP_ARP_TABLE,
-                        install
-                );
-            } else {
-                log.warn("Invalid ARP mode {}. Please use either broadcast or proxy mode.", arpMode);
-            }
+            TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                    .setOutput(PortNumber.FLOOD)
+                    .build();
+
+            osFlowRuleService.setRule(
+                    appId,
+                    osNode.intgBridge(),
+                    selector,
+                    treatment,
+                    PRIORITY_ARP_SUBNET_RULE,
+                    DHCP_ARP_TABLE,
+                    install
+            );
         }
     }
 
@@ -526,6 +554,9 @@ public final class OpenstackSwitchingArpHandler {
                     setArpRequestRule(event.subject(), false);
                     setArpReplyRule(event.subject(), false);
                     break;
+                case OPENSTACK_INSTANCE_MIGRATION_ENDED:
+                    setArpRequestRule(event.subject(), false);
+                    break;
                 default:
                     break;
             }
@@ -545,7 +576,8 @@ public final class OpenstackSwitchingArpHandler {
                     setRemoteArpRequestRuleForVxlan(port, install);
                     break;
                 case VLAN:
-                    // TODO: handle VLAN differently
+                    // since VLAN ARP packet can be broadcasted to all hosts that connected with L2 network,
+                    // there is no need to add any flow rules to handle ARP request
                     break;
                 default:
                     break;
@@ -563,10 +595,10 @@ public final class OpenstackSwitchingArpHandler {
 
             switch (type) {
                 case VXLAN:
-                    setArpReplyRuleVxlan(port, install);
+                    setArpReplyRuleForVxlan(port, install);
                     break;
                 case VLAN:
-                    // TODO: handle VLAN differently
+                    setArpReplyRuleForVlan(port, install);
                     break;
                 default:
                     break;
@@ -598,10 +630,28 @@ public final class OpenstackSwitchingArpHandler {
          * @param port      instance port
          * @param install   installation flag
          */
-        private void setArpReplyRuleVxlan(InstancePort port, boolean install) {
+        private void setArpReplyRuleForVxlan(InstancePort port, boolean install) {
 
             OpenstackNode localNode = osNodeService.node(port.deviceId());
 
+            TrafficSelector selector = setArpReplyRuleForVnet(port, install);
+            setRemoteArpTreatmentForVxlan(selector, port, localNode, install);
+        }
+
+        /**
+         * Installs flow rules to match ARP reply packets only for VLAN.
+         *
+         * @param port      instance port
+         * @param install   installation flag
+         */
+        private void setArpReplyRuleForVlan(InstancePort port, boolean install) {
+
+            TrafficSelector selector = setArpReplyRuleForVnet(port, install);
+            setRemoteArpTreatmentForVlan(selector, port, install);
+        }
+
+        // a helper method
+        private TrafficSelector setArpReplyRuleForVnet(InstancePort port, boolean install) {
             TrafficSelector selector = DefaultTrafficSelector.builder()
                     .matchEthType(EthType.EtherType.ARP.ethType().toShort())
                     .matchArpOp(ARP.OP_REPLY)
@@ -623,7 +673,7 @@ public final class OpenstackSwitchingArpHandler {
                     install
             );
 
-            setRemoteArpTreatmentForVxlan(selector, port, localNode, install);
+            return selector;
         }
 
         // a helper method
@@ -651,6 +701,28 @@ public final class OpenstackSwitchingArpHandler {
                             DHCP_ARP_TABLE,
                             install
                     );
+                }
+            }
+        }
+
+        // a helper method
+        private void setRemoteArpTreatmentForVlan(TrafficSelector selector,
+                                                  InstancePort port,
+                                                  boolean install) {
+            for (OpenstackNode remoteNode : osNodeService.completeNodes(COMPUTE)) {
+                if (!remoteNode.intgBridge().equals(port.deviceId()) && remoteNode.vlanIntf() != null) {
+                    TrafficTreatment treatmentToRemote = DefaultTrafficTreatment.builder()
+                            .setOutput(remoteNode.vlanPortNum())
+                            .build();
+
+                    osFlowRuleService.setRule(
+                            appId,
+                            remoteNode.intgBridge(),
+                            selector,
+                            treatmentToRemote,
+                            PRIORITY_ARP_REQUEST_RULE,
+                            DHCP_ARP_TABLE,
+                            install);
                 }
             }
         }

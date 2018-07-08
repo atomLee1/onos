@@ -16,6 +16,8 @@
 package org.onosproject.openstacknetworking.impl;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
@@ -30,7 +32,9 @@ import org.onosproject.core.CoreService;
 import org.onosproject.mastership.MastershipService;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.DefaultAnnotations;
+import org.onosproject.net.DefaultHost;
 import org.onosproject.net.Device;
+import org.onosproject.net.DeviceId;
 import org.onosproject.net.Host;
 import org.onosproject.net.HostId;
 import org.onosproject.net.HostLocation;
@@ -46,6 +50,8 @@ import org.onosproject.net.host.HostProviderService;
 import org.onosproject.net.host.HostService;
 import org.onosproject.net.provider.AbstractProvider;
 import org.onosproject.net.provider.ProviderId;
+import org.onosproject.openstacknetworking.api.InstancePort;
+import org.onosproject.openstacknetworking.api.InstancePortService;
 import org.onosproject.openstacknetworking.api.OpenstackNetworkService;
 import org.onosproject.openstacknode.api.OpenstackNode;
 import org.onosproject.openstacknode.api.OpenstackNodeEvent;
@@ -56,6 +62,7 @@ import org.openstack4j.model.network.NetworkType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,9 +71,11 @@ import java.util.stream.Collectors;
 import static org.onlab.util.Tools.groupedThreads;
 import static org.onosproject.net.AnnotationKeys.PORT_NAME;
 import static org.onosproject.openstacknetworking.api.Constants.OPENSTACK_NETWORKING_APP_ID;
+import static org.onosproject.openstacknetworking.api.Constants.portNamePrefixMap;
 import static org.onosproject.openstacknetworking.impl.HostBasedInstancePort.ANNOTATION_CREATE_TIME;
 import static org.onosproject.openstacknetworking.impl.HostBasedInstancePort.ANNOTATION_NETWORK_ID;
 import static org.onosproject.openstacknetworking.impl.HostBasedInstancePort.ANNOTATION_PORT_ID;
+import static org.onosproject.openstacknode.api.OpenstackNode.NodeType.CONTROLLER;
 
 @Service
 @Component(immediate = true)
@@ -100,12 +109,18 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected OpenstackNodeService osNodeService;
 
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected InstancePortService instancePortService;
+
     private final ExecutorService deviceEventExecutor =
             Executors.newSingleThreadExecutor(groupedThreads("openstacknetworking", "device-event"));
     private final InternalDeviceListener internalDeviceListener = new InternalDeviceListener();
     private final InternalOpenstackNodeListener internalNodeListener = new InternalOpenstackNodeListener();
 
     private HostProviderService hostProvider;
+
+    private Map<HostId, Device> hostDeviceMap = Maps.newConcurrentMap();
+    private Set<Host> migratingHosts = Sets.newConcurrentHashSet();
 
     /**
      * Creates OpenStack switching host provider.
@@ -148,7 +163,7 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
      *
      * @param port port object used in ONOS
      */
-    private void processPortAdded(Port port) {
+    private void processPortAdded(Port port, Device device) {
         // TODO check the node state is COMPLETE
         org.openstack4j.model.network.Port osPort = osNetworkService.port(port);
         if (osPort == null) {
@@ -173,6 +188,24 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
                 .map(ip -> IpAddress.valueOf(ip.getIpAddress()))
                 .collect(Collectors.toSet());
         ConnectPoint connectPoint = new ConnectPoint(port.element().id(), port.number());
+        HostId oldHostId = HostId.hostId(macAddr);
+
+        // In VM migration case, a duplicated host port (port created in at new
+        // compute node) will be detected at OVS; in this case, we will store
+        // the old host instance into migration list, and overwrite old host
+        // with new host instance issue host creation event to ONOS core
+        Device oldDevice = hostDeviceMap.get(oldHostId);
+
+        if (device != null && oldDevice != null && !oldDevice.equals(device)) {
+            Host host = hostService.getHost(oldHostId);
+            if (host != null) {
+                migratingHosts.add(host);
+            }
+        }
+
+        if (device != null) {
+            hostDeviceMap.put(oldHostId, device);
+        }
 
         DefaultAnnotations.Builder annotations = DefaultAnnotations.builder()
                 .set(ANNOTATION_NETWORK_ID, osPort.getNetworkId())
@@ -184,15 +217,25 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
 
         }
 
+        long currentTime = System.currentTimeMillis();
+
         HostDescription hostDesc = new DefaultHostDescription(
                 macAddr,
                 VlanId.NONE,
-                new HostLocation(connectPoint, System.currentTimeMillis()),
+                new HostLocation(connectPoint, currentTime),
                 fixedIps,
                 annotations.build());
 
         HostId hostId = HostId.hostId(macAddr);
         hostProvider.hostDetected(hostId, hostDesc, false);
+
+        if (device != null && oldDevice != null && !oldDevice.equals(device)) {
+            Host oldHost = hostService.getHost(oldHostId);
+            Host newHost = new DefaultHost(oldHost.providerId(), hostId, macAddr,
+                    VlanId.NONE, new HostLocation(connectPoint, currentTime),
+                    fixedIps, annotations.build());
+            instancePortService.migrationPortAdded(HostBasedInstancePort.of(newHost));
+        }
     }
 
     /**
@@ -201,12 +244,37 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
      * instance through host provider by giving connect point information,
      * and vanishes it.
      *
-     * @param port port object used in ONOS
+     * @param event device event
      */
-    private void processPortRemoved(Port port) {
+    private void processPortRemoved(DeviceEvent event) {
+        Port port = event.port();
+        DeviceId deviceId = event.subject().id();
         ConnectPoint connectPoint = new ConnectPoint(port.element().id(), port.number());
-        hostService.getConnectedHosts(connectPoint)
-                    .forEach(host -> hostProvider.hostVanished(host.id()));
+
+        Set<Host> hostsToBeRemoved = hostService.getConnectedHosts(connectPoint);
+
+        if (hostsToBeRemoved.size() == 0) {
+
+            for (Host host : migratingHosts) {
+                if (host.location() == null) {
+                    continue;
+                }
+                String hostLocation = host.location().toString();
+                StringBuilder deviceIdWithPort = new StringBuilder();
+                deviceIdWithPort.append(deviceId.toString());
+                deviceIdWithPort.append("/");
+                deviceIdWithPort.append(port.number().toString());
+
+                if (hostLocation.equals(deviceIdWithPort.toString())) {
+                    InstancePort instPort = HostBasedInstancePort.of(host);
+                    instancePortService.migrationPortRemoved(instPort);
+                    migratingHosts.remove(host);
+                }
+            }
+
+        } else {
+            hostsToBeRemoved.forEach(host -> hostProvider.hostVanished(host.id()));
+        }
     }
 
     /**
@@ -229,11 +297,16 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
             String portName = port.annotations().value(PORT_NAME);
 
             return !Strings.isNullOrEmpty(portName) &&
-                    portName.startsWith(PORT_NAME_PREFIX_VM);
+                    (portName.startsWith(PORT_NAME_PREFIX_VM) || isDirectPort(portName));
+        }
+
+        private boolean isDirectPort(String portName) {
+            return portNamePrefixMap().values().stream().filter(p -> portName.startsWith(p)).findAny().isPresent();
         }
 
         @Override
         public void event(DeviceEvent event) {
+            log.info("Device event occurred with type {}", event.type());
             switch (event.type()) {
                 case PORT_UPDATED:
                     if (!event.port().isEnabled()) {
@@ -266,7 +339,7 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
             log.debug("Instance port {} is detected from {}",
                     event.port().annotations().value(PORT_NAME),
                     event.subject().id());
-            processPortAdded(event.port());
+            processPortAdded(event.port(), event.subject());
         });
     }
 
@@ -282,7 +355,7 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
             log.debug("Instance port {} is removed from {}",
                     event.port().annotations().value(PORT_NAME),
                     event.subject().id());
-            processPortRemoved(event.port());
+            processPortRemoved(event);
         });
     }
 
@@ -290,6 +363,10 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
 
         @Override
         public boolean isRelevant(OpenstackNodeEvent event) {
+
+            if (event.subject().type() == CONTROLLER) {
+                return false;
+            }
             // do not allow to proceed without mastership
             Device device = deviceService.getDevice(event.subject().intgBridge());
             if (device == null) {
@@ -318,7 +395,6 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
                     // not reacts to the events other than complete and incomplete states
                     break;
                 default:
-                    log.warn("Unsupported openstack node event type");
                     break;
             }
         }
@@ -332,8 +408,23 @@ public final class OpenstackSwitchingHostProvider extends AbstractProvider imple
                         log.debug("Instance port {} is detected from {}",
                                   port.annotations().value(PORT_NAME),
                                   osNode.hostname());
-                        processPortAdded(port);
+                        processPortAdded(port,
+                                deviceService.getDevice(osNode.intgBridge()));
                     });
+
+            portNamePrefixMap().values().forEach(portNamePrefix -> {
+                deviceService.getPorts(osNode.intgBridge()).stream()
+                        .filter(port -> port.annotations().value(PORT_NAME)
+                                .startsWith(portNamePrefix) &&
+                                port.isEnabled())
+                        .forEach(port -> {
+                            log.debug("Instance port {} is detected from {}",
+                                    port.annotations().value(portNamePrefix),
+                                    osNode.hostname());
+                            processPortAdded(port,
+                                    deviceService.getDevice(osNode.intgBridge()));
+                        });
+            });
 
             Tools.stream(hostService.getHosts())
                     .filter(host -> deviceService.getPort(

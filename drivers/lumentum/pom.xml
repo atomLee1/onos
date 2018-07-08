@@ -55,7 +55,7 @@
         </dependency>
         <dependency>
             <groupId>org.onosproject</groupId>
-            <artifactId>onos-snmp-api</artifactId>
+            <artifactId>onos-protocols-snmp-api</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>
@@ -71,6 +71,16 @@
         <dependency>
             <groupId>org.onosproject</groupId>
             <artifactId>onos-drivers-optical</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.onosproject</groupId>
+            <artifactId>onos-drivers-utilities</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.onosproject</groupId>
+            <artifactId>onos-protocols-netconf-api</artifactId>
             <version>${project.version}</version>
         </dependency>
     </dependencies>

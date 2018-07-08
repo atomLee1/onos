@@ -68,6 +68,7 @@ import org.onosproject.net.flow.instructions.ExtensionPropertyException;
 import org.onosproject.net.flow.instructions.ExtensionTreatment;
 import org.onosproject.net.flow.instructions.ExtensionTreatmentType;
 import org.onosproject.net.provider.ProviderId;
+import org.onosproject.openstacknode.api.DefaultOpenstackNode;
 import org.onosproject.openstacknode.api.NodeState;
 import org.onosproject.openstacknode.api.OpenstackAuth;
 import org.onosproject.openstacknode.api.OpenstackNode;
@@ -82,11 +83,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.easymock.EasyMock.anyBoolean;
 import static org.easymock.EasyMock.anyObject;
 import static org.easymock.EasyMock.createMock;
 import static org.easymock.EasyMock.expect;
-import static org.easymock.EasyMock.expectLastCall;
 import static org.easymock.EasyMock.replay;
 import static org.junit.Assert.assertEquals;
 import static org.onosproject.net.AnnotationKeys.PORT_NAME;
@@ -240,9 +239,6 @@ public class DefaultOpenstackNodeHandlerTest {
         expect(mockOvsdbController.getOvsdbClient(anyObject()))
                 .andReturn(mockOvsdbClient)
                 .anyTimes();
-        mockOvsdbController.setServerMode(anyBoolean());
-        expectLastCall();
-
         replay(mockOvsdbController);
 
         testNodeManager = new TestOpenstackNodeManager();
@@ -413,7 +409,7 @@ public class DefaultOpenstackNodeHandlerTest {
                 intgBridge.id(),
                 ipAddr,
                 ipAddr,
-                null, null, state, phyIntfs, null);
+                null, null, state, phyIntfs, null, null);
     }
 
     private static OpenstackNode createGatewayNode(String hostname,
@@ -428,7 +424,7 @@ public class DefaultOpenstackNodeHandlerTest {
                 intgBridge.id(),
                 ipAddr,
                 ipAddr,
-                null, uplinkPort, state, null, null);
+                null, uplinkPort, state, null, null, null);
     }
 
     private static final class TestDevice extends DefaultDevice {
@@ -487,7 +483,8 @@ public class DefaultOpenstackNodeHandlerTest {
                                   String uplinkPort,
                                   NodeState state,
                                   Set<OpenstackPhyInterface> phyIntfs,
-                                  OpenstackAuth auth) {
+                                  OpenstackAuth auth,
+                                  String endPoint) {
             super(hostname,
                     type,
                     intgBridge,
@@ -497,7 +494,8 @@ public class DefaultOpenstackNodeHandlerTest {
                     uplinkPort,
                     state,
                     phyIntfs,
-                    auth);
+                    auth,
+                    endPoint);
         }
 
         @Override

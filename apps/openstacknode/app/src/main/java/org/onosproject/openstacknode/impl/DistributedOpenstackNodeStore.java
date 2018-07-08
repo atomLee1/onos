@@ -25,6 +25,7 @@ import org.apache.felix.scr.annotations.Service;
 import org.onlab.util.KryoNamespace;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
+import org.onosproject.openstacknode.api.DefaultOpenstackNode;
 import org.onosproject.openstacknode.api.NodeState;
 import org.onosproject.openstacknode.api.OpenstackNode;
 import org.onosproject.openstacknode.api.OpenstackNodeEvent;
@@ -166,23 +167,6 @@ public class DistributedOpenstackNodeStore
         @Override
         public void event(MapEvent<String, OpenstackNode> event) {
 
-            OpenstackNode node;
-
-            if (event.type() == INSERT || event.type() == UPDATE) {
-                node = event.newValue().value();
-            } else {
-                node = event.oldValue().value();
-            }
-
-            // we do not notify the controller node related event
-            // controller node event should be handled in different way
-            if (node.type() == CONTROLLER) {
-                // TODO: need to find a way to check the controller node availability
-                log.info("node {} is detected", node.hostname());
-
-                return;
-            }
-
             switch (event.type()) {
                 case INSERT:
                     log.debug("OpenStack node created {}", event.newValue());
@@ -198,6 +182,13 @@ public class DistributedOpenstackNodeStore
                                 OPENSTACK_NODE_UPDATED,
                                 event.newValue().value()
                         ));
+
+                        // if the event is about controller node, we will not
+                        // process COMPLETE and INCOMPLETE state
+                        if (isControllerNode(event)) {
+                            return;
+                        }
+
                         if (event.newValue().value().state() == COMPLETE) {
                             notifyDelegate(new OpenstackNodeEvent(
                                     OPENSTACK_NODE_COMPLETE,
@@ -222,6 +213,26 @@ public class DistributedOpenstackNodeStore
                     // do nothing
                     break;
             }
+        }
+
+        /**
+         * Checks the openstack node whether a controller node or not with
+         * the given MapEvent.
+         *
+         * @param event map event
+         * @return controller node indicator flag
+         */
+        private boolean isControllerNode(MapEvent<String, OpenstackNode> event) {
+
+            OpenstackNode node;
+
+            if (event.type() == INSERT || event.type() == UPDATE) {
+                node = event.newValue().value();
+            } else {
+                node = event.oldValue().value();
+            }
+
+            return node.type() == CONTROLLER;
         }
     }
 }

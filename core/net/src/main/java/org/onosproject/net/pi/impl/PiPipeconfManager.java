@@ -16,10 +16,8 @@
 
 package org.onosproject.net.pi.impl;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.Beta;
+import com.google.common.base.Objects;
 import com.google.common.collect.ImmutableSet;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
@@ -29,12 +27,8 @@ import org.apache.felix.scr.annotations.ReferenceCardinality;
 import org.apache.felix.scr.annotations.Service;
 import org.onlab.util.ItemNotFoundException;
 import org.onosproject.cluster.ClusterService;
-import org.onosproject.cluster.LeadershipService;
-import org.onosproject.cluster.NodeId;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.config.ConfigFactory;
-import org.onosproject.net.config.NetworkConfigEvent;
-import org.onosproject.net.config.NetworkConfigListener;
 import org.onosproject.net.config.NetworkConfigRegistry;
 import org.onosproject.net.config.basics.BasicDeviceConfig;
 import org.onosproject.net.config.basics.SubjectFactories;
@@ -55,8 +49,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -75,14 +69,12 @@ public class PiPipeconfManager implements PiPipeconfService {
 
     private final Logger log = getLogger(getClass());
 
+    private static final String MERGED_DRIVER_SEPARATOR = ":";
     private static final String DRIVER = "driver";
     private static final String CFG_SCHEME = "piPipeconf";
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected NetworkConfigRegistry cfgService;
-
-    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected LeadershipService leadershipService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected DriverService driverService;
@@ -91,19 +83,20 @@ public class PiPipeconfManager implements PiPipeconfService {
     protected DriverAdminService driverAdminService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected PiPipeconfMappingStore pipeconfMappingStore;
+    private PiPipeconfMappingStore pipeconfMappingStore;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected ClusterService clusterService;
 
-    // Registered pipeconf are replicated through the app subsystem and registered on app activated events.
-    protected ConcurrentHashMap<PiPipeconfId, PiPipeconf> piPipeconfs = new ConcurrentHashMap<>();
+    // Registered pipeconf are replicated through the app subsystem and
+    // registered on app activated events. Hence, there should be no need of
+    // distributing this map.
+    protected ConcurrentMap<PiPipeconfId, PiPipeconf> pipeconfs = new ConcurrentHashMap<>();
 
-    protected ExecutorService executor =
-            Executors.newFixedThreadPool(5, groupedThreads("onos/pipipeconfservice",
-                    "pipeline-to-device-%d", log));
+    protected ExecutorService executor = Executors.newFixedThreadPool(
+            10, groupedThreads("onos/pipeconf-manager", "%d", log));
 
-    protected final ConfigFactory factory =
+    protected final ConfigFactory configFactory =
             new ConfigFactory<DeviceId, PiPipeconfConfig>(
                     SubjectFactories.DEVICE_SUBJECT_FACTORY,
                     PiPipeconfConfig.class, CFG_SCHEME) {
@@ -113,14 +106,9 @@ public class PiPipeconfManager implements PiPipeconfService {
                 }
             };
 
-    protected final NetworkConfigListener cfgListener = new InternalNetworkConfigListener();
-
     @Activate
     public void activate() {
-        cfgService.registerConfigFactory(factory);
-        cfgService.addListener(cfgListener);
-        cfgService.getSubjects(DeviceId.class, PiPipeconfConfig.class)
-                .forEach(this::addPipeconfFromCfg);
+        cfgService.registerConfigFactory(configFactory);
         log.info("Started");
     }
 
@@ -128,9 +116,8 @@ public class PiPipeconfManager implements PiPipeconfService {
     @Deactivate
     public void deactivate() {
         executor.shutdown();
-        cfgService.removeListener(cfgListener);
-        cfgService.unregisterConfigFactory(factory);
-        piPipeconfs.clear();
+        cfgService.unregisterConfigFactory(configFactory);
+        pipeconfs.clear();
         cfgService = null;
         driverAdminService = null;
         driverService = null;
@@ -139,102 +126,43 @@ public class PiPipeconfManager implements PiPipeconfService {
 
     @Override
     public void register(PiPipeconf pipeconf) throws IllegalStateException {
-        log.warn("Currently using local maps, needs to be moved to a distributed store");
-        if (piPipeconfs.containsKey(pipeconf.id())) {
+        if (pipeconfs.containsKey(pipeconf.id())) {
             throw new IllegalStateException(format("Pipeconf %s is already registered", pipeconf.id()));
         }
-        piPipeconfs.put(pipeconf.id(), pipeconf);
+        pipeconfs.put(pipeconf.id(), pipeconf);
         log.info("New pipeconf registered: {}", pipeconf.id());
     }
 
     @Override
     public void remove(PiPipeconfId pipeconfId) throws IllegalStateException {
-        //TODO add mechanism to remove from device.
-        if (!piPipeconfs.containsKey(pipeconfId)) {
+        // TODO add mechanism to remove from device.
+        if (!pipeconfs.containsKey(pipeconfId)) {
             throw new IllegalStateException(format("Pipeconf %s is not registered", pipeconfId));
         }
         // TODO remove the binding from the distributed Store when the lifecycle of a pipeconf is defined.
         // pipeconfMappingStore.removeBindings(pipeconfId);
-        piPipeconfs.remove(pipeconfId);
+        log.info("Removing pipeconf {}", pipeconfId);
+        pipeconfs.remove(pipeconfId);
     }
 
     @Override
     public Iterable<PiPipeconf> getPipeconfs() {
-        return piPipeconfs.values();
+        return pipeconfs.values();
     }
 
     @Override
     public Optional<PiPipeconf> getPipeconf(PiPipeconfId id) {
-        return Optional.ofNullable(piPipeconfs.get(id));
+        return Optional.ofNullable(pipeconfs.get(id));
     }
 
     @Override
-    public CompletableFuture<Boolean> bindToDevice(PiPipeconfId pipeconfId, DeviceId deviceId) {
-        CompletableFuture<Boolean> operationResult = new CompletableFuture<>();
+    public void bindToDevice(PiPipeconfId pipeconfId, DeviceId deviceId) {
+        pipeconfMappingStore.createOrUpdateBinding(deviceId, pipeconfId);
+    }
 
-        executor.execute(() -> {
-            BasicDeviceConfig basicDeviceConfig =
-                    cfgService.getConfig(deviceId, BasicDeviceConfig.class);
-            Driver baseDriver = driverService.getDriver(basicDeviceConfig.driver());
-
-            String completeDriverName = baseDriver.name() + ":" + pipeconfId;
-            PiPipeconf piPipeconf = piPipeconfs.get(pipeconfId);
-            if (piPipeconf == null) {
-                log.warn("Pipeconf {} is not present", pipeconfId);
-                operationResult.complete(false);
-            } else {
-                //if driver exists already we don't create a new one.
-                //needs to be done via exception catching due to DriverRegistry throwing it on a null return from
-                //the driver map.
-                try {
-                    driverService.getDriver(completeDriverName);
-                } catch (ItemNotFoundException e) {
-
-                    log.debug("First time pipeconf {} is used with base driver {}, merging the two",
-                            pipeconfId, baseDriver);
-                    //extract the behaviours from the pipipeconf.
-                    Map<Class<? extends Behaviour>, Class<? extends Behaviour>> behaviours = new HashMap<>();
-                    piPipeconf.behaviours().forEach(b -> {
-                        behaviours.put(b, piPipeconf.implementation(b).get());
-                    });
-
-                    Driver piPipeconfDriver = new DefaultDriver(completeDriverName, baseDriver.parents(),
-                            baseDriver.manufacturer(), baseDriver.hwVersion(),
-                            baseDriver.swVersion(), behaviours, new HashMap<>());
-                    //we take the base driver created with the behaviours of the PiPeconf and
-                    // merge it with the base driver that was assigned to the device
-                    Driver completeDriver = piPipeconfDriver.merge(baseDriver);
-
-                    //This might lead to explosion of number of providers in the core,
-                    // due to 1:1:1 pipeconf:driver:provider maybe find better way
-                    DriverProvider provider = new PiPipeconfDriverProviderInternal(completeDriver);
-
-                    //we register to the driver susbystem the driver provider containing the merged driver
-                    driverAdminService.registerProvider(provider);
-                }
-
-                // Changing the configuration for the device to enforce the full driver with pipipeconf
-                // and base behaviours, updating binding only first time something changes
-                NodeId leaderNodeId = leadershipService.getLeader("deploy-" +
-                        deviceId.toString() + "-pipeconf");
-                NodeId localNodeId = clusterService.getLocalNode().id();
-
-                if (!basicDeviceConfig.driver().equals(completeDriverName) && localNodeId.equals(leaderNodeId)) {
-                    ObjectNode newCfg = (ObjectNode) basicDeviceConfig.node();
-                    newCfg = newCfg.put(DRIVER, completeDriverName);
-                    ObjectMapper mapper = new ObjectMapper();
-                    JsonNode newCfgNode = mapper.convertValue(newCfg, JsonNode.class);
-                    log.debug("New driver {} for device {}", completeDriverName, deviceId);
-                    cfgService.applyConfig(deviceId, BasicDeviceConfig.class, newCfgNode);
-                    // Completable future is needed for when this method will also apply the pipeline to the device.
-                    // FIXME (maybe): the pipeline is currently applied by the general device provider.
-                    // But we store here the association between device and pipeconf.
-                    pipeconfMappingStore.createOrUpdateBinding(deviceId, pipeconfId);
-                }
-                operationResult.complete(true);
-            }
-        });
-        return operationResult;
+    @Override
+    public String mergeDriver(DeviceId deviceId, PiPipeconfId pipeconfId) {
+        return doMergeDriver(deviceId, pipeconfId);
     }
 
     @Override
@@ -242,12 +170,111 @@ public class PiPipeconfManager implements PiPipeconfService {
         return Optional.ofNullable(pipeconfMappingStore.getPipeconfId(deviceId));
     }
 
+    private String doMergeDriver(DeviceId deviceId, PiPipeconfId pipeconfId) {
+        log.debug("Starting device driver merge of {} with {}...", deviceId, pipeconfId);
+        final BasicDeviceConfig basicDeviceConfig = cfgService.getConfig(
+                deviceId, BasicDeviceConfig.class);
+        if (basicDeviceConfig == null) {
+            log.warn("Unable to get basic device config for {}, " +
+                             "aborting pipeconf driver merge");
+            return null;
+        }
+        String baseDriverName = basicDeviceConfig.driver();
+        if (baseDriverName.endsWith(mergedDriverSuffix(pipeconfId))) {
+            // The config already has driver name that is a merged one. We still
+            // need to make sure an instance of that merged driver is present in
+            // this node.
+            log.debug("Base driver of {} ({}) has been already merged with {}",
+                      deviceId, baseDriverName, pipeconfId);
+            baseDriverName = getBaseDriverNameFromMerged(baseDriverName);
+        }
 
-    private class PiPipeconfDriverProviderInternal implements DriverProvider {
+        final String newDriverName = mergedDriverName(baseDriverName, pipeconfId);
+        // If merged driver exists already we don't create a new one.
+        try {
+            driverService.getDriver(newDriverName);
+            return newDriverName;
+        } catch (ItemNotFoundException e) {
+            log.info("Creating merged driver {}...", newDriverName);
+        }
+        final Driver mergedDriver = buildMergedDriver(
+                pipeconfId, baseDriverName, newDriverName);
+        if (mergedDriver == null) {
+            // Error logged by buildMergedDriver
+            return null;
+        }
+        registerMergedDriver(mergedDriver);
+        return newDriverName;
+    }
+
+    private String mergedDriverSuffix(PiPipeconfId pipeconfId) {
+        return MERGED_DRIVER_SEPARATOR + pipeconfId.id();
+    }
+
+    private String mergedDriverName(String baseDriverName, PiPipeconfId pipeconfId) {
+        return baseDriverName + mergedDriverSuffix(pipeconfId);
+    }
+
+    private String getBaseDriverNameFromMerged(String mergedDriverName) {
+        final String[] pieces = mergedDriverName.split(MERGED_DRIVER_SEPARATOR);
+        if (pieces.length != 2) {
+            log.error("Unrecognized merged driver name format '{}', cannot " +
+                              "extract base driver name", mergedDriverName);
+            return null;
+        }
+        return pieces[0];
+    }
+
+    private Driver buildMergedDriver(PiPipeconfId pipeconfId, String baseDriverName,
+                                     String newDriverName) {
+        final Driver baseDriver;
+        try {
+            baseDriver = driverService.getDriver(baseDriverName);
+        } catch (ItemNotFoundException e) {
+            log.error("Base driver {} not found, cannot build a merged one",
+                      baseDriverName);
+            return null;
+        }
+
+        final PiPipeconf pipeconf = pipeconfs.get(pipeconfId);
+        if (pipeconf == null) {
+            log.error("Pipeconf {} is not registered, cannot build a merged driver",
+                      pipeconfId);
+            return null;
+        }
+
+        // extract the behaviours from the pipipeconf.
+        final Map<Class<? extends Behaviour>, Class<? extends Behaviour>> behaviours =
+                new HashMap<>();
+        pipeconf.behaviours().forEach(
+                b -> behaviours.put(b, pipeconf.implementation(b).get()));
+        final Driver piPipeconfDriver = new DefaultDriver(
+                newDriverName, baseDriver.parents(),
+                baseDriver.manufacturer(), baseDriver.hwVersion(),
+                baseDriver.swVersion(), behaviours, new HashMap<>());
+        // take the base driver created with the behaviours of the PiPeconf and
+        // merge it with the base driver that was assigned to the device
+        return piPipeconfDriver.merge(baseDriver);
+    }
+
+    private void registerMergedDriver(Driver driver) {
+        final DriverProvider provider = new InternalDriverProvider(driver);
+        if (driverAdminService.getProviders().contains(provider)) {
+            // A provider for this driver already exist.
+            return;
+        }
+        driverAdminService.registerProvider(provider);
+    }
+
+    /**
+     * Internal driver provider used to register merged pipeconf drivers in the
+     * core.
+     */
+    private class InternalDriverProvider implements DriverProvider {
 
         Driver driver;
 
-        PiPipeconfDriverProviderInternal(Driver driver) {
+        InternalDriverProvider(Driver driver) {
             this.driver = driver;
         }
 
@@ -255,36 +282,22 @@ public class PiPipeconfManager implements PiPipeconfService {
         public Set<Driver> getDrivers() {
             return ImmutableSet.of(driver);
         }
-    }
-
-    private void addPipeconfFromCfg(DeviceId deviceId) {
-        PiPipeconfConfig pipeconfConfig =
-                cfgService.getConfig(deviceId, PiPipeconfConfig.class);
-        PiPipeconfId id = pipeconfConfig.piPipeconfId();
-        if (id.id().equals("")) {
-            log.warn("Not adding empty pipeconfId for device {}", deviceId);
-        } else {
-            pipeconfMappingStore.createOrUpdateBinding(deviceId, id);
-        }
-    }
-
-    /**
-     * Listener for configuration events.
-     */
-    private class InternalNetworkConfigListener implements NetworkConfigListener {
-
 
         @Override
-        public void event(NetworkConfigEvent event) {
-            DeviceId deviceId = (DeviceId) event.subject();
-            addPipeconfFromCfg(deviceId);
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            InternalDriverProvider that = (InternalDriverProvider) o;
+            return Objects.equal(driver.name(), that.driver.name());
         }
 
         @Override
-        public boolean isRelevant(NetworkConfigEvent event) {
-            return event.configClass().equals(PiPipeconfConfig.class) &&
-                    (event.type() == NetworkConfigEvent.Type.CONFIG_ADDED ||
-                            event.type() == NetworkConfigEvent.Type.CONFIG_UPDATED);
+        public int hashCode() {
+            return Objects.hashCode(driver.name());
         }
     }
 }

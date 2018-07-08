@@ -15,9 +15,11 @@
 set -e
 
 BUILD_DIR=~/p4tools
-BMV2_COMMIT="7e25eeb19d01eee1a8e982dc7ee90ee438c10a05"
-PI_COMMIT="219b3d67299ec09b49f433d7341049256ab5f512"
-P4C_COMMIT="48a57a6ae4f96961b74bd13f6bdeac5add7bb815"
+# in case BMV2_COMMIT value is updated, the same variable in
+# protocols/bmv2/thrift-api/BUCK file should also be updated
+BMV2_COMMIT="ed130d01be985d814c17de949839d484e76400b1"
+PI_COMMIT="59c940916b4f5b182f33b4788d8c410972eaecce"
+P4C_COMMIT="618d15155dcc2d784cc14a8e83131b407cf893e2"
 PROTOBUF_COMMIT="tags/v3.2.0"
 GRPC_COMMIT="tags/v1.3.2"
 LIBYANG_COMMIT="v0.14-r1"
@@ -25,6 +27,10 @@ SYSREPO_COMMIT="v0.7.2"
 P4RT_TEST_COMMIT="master"
 
 NUM_CORES=`grep -c ^processor /proc/cpuinfo`
+
+# If false, build tools without debug features to improve throughput of BMv2 and
+# reduce CPU/memory footprint.
+DEBUG_FLAGS=${DEBUG_FLAGS:-true}
 
 function do_requirements {
     sudo apt update
@@ -71,17 +77,13 @@ function do_requirements {
         mktemp \
         pkg-config \
         protobuf-c-compiler \
-        python \
-        python-dev \
-        python-ipaddr \
-        python-pip \
-        python-scapy \
-        python-setuptools \
+        python2.7 \
+        python2.7-dev \
         tcpdump \
         wget \
         unzip
 
-    sudo pip install setuptools cffi grpcio
+    sudo -H pip install setuptools cffi grpcio scapy ipaddr
 }
 
 function do_requirements_1404 {
@@ -261,7 +263,12 @@ function do_p4runtime {
     ./autogen.sh
     # FIXME: re-enable --with-sysrepo when gNMI support becomes more stable
     # ./configure --with-proto --with-sysrepo 'CXXFLAGS=-O0 -g'
-    ./configure --with-proto 'CXXFLAGS=-O0 -g'
+    if [ "${DEBUG_FLAGS}" = true ] ; then
+        CONF_FLAGS="'CXXFLAGS=-O0 -g'"
+    else
+        CONF_FLAGS=""
+    fi
+    ./configure --with-proto ${CONF_FLAGS}
     make -j${NUM_CORES}
     sudo make install
     sudo ldconfig
@@ -274,7 +281,12 @@ function do_bmv2 {
     checkout_bmv2
 
     ./autogen.sh
-    ./configure --enable-debugger --with-pi 'CXXFLAGS=-O0 -g'
+    if [ "${DEBUG_FLAGS}" = true ] ; then
+        CONF_FLAGS="--enable-debugger 'CXXFLAGS=-O0 -g'"
+    else
+        CONF_FLAGS="--disable-logging-macros --disable-elogger --without-nanomsg"
+    fi
+    ./configure --with-pi ${CONF_FLAGS}
     make -j${NUM_CORES}
     sudo make install
     sudo ldconfig
@@ -283,9 +295,14 @@ function do_bmv2 {
     cd targets/simple_switch_grpc
     ./autogen.sh
 
+    if [ "${DEBUG_FLAGS}" = true ] ; then
+        CONF_FLAGS="'CXXFLAGS=-O0 -g'"
+    else
+        CONF_FLAGS=""
+    fi
     # FIXME: re-enable --with-sysrepo when gNMI support becomes more stable
     # ./configure --with-sysrepo --with-thrift 'CXXFLAGS=-O0 -g'
-    ./configure --with-thrift 'CXXFLAGS=-O0 -g'
+    ./configure --with-thrift ${CONF_FLAGS}
     make -j${NUM_CORES}
     sudo make install
     sudo ldconfig

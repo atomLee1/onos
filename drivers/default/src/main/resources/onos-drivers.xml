@@ -279,5 +279,27 @@
                    impl="org.onosproject.driver.pipeline.CentecV350Pipeline"/>
     </driver>
     -->
+
+    <driver name="Arista" extends="default"
+            manufacturer="Arista.*" hwVersion="DCS.*" swVersion=".*">
+        <behaviour api="org.onosproject.net.behaviour.Pipeliner"
+                   impl="org.onosproject.driver.pipeline.AristaPipeliner"/>
+        <property name="meterCapable">false</property>
+    </driver>
+
+    <driver name="juniper"
+            manufacturer="Juniper.*" hwVersion="qfx5100.*" swVersion=".*">
+        <behaviour api="org.onosproject.openflow.controller.driver.OpenFlowSwitchDriver"
+                   impl="org.onosproject.driver.handshaker.JuniperSwitchHandshaker"/>
+        <behaviour api="org.onosproject.net.behaviour.Pipeliner"
+                   impl="org.onosproject.driver.pipeline.JuniperQfx5100Pipeliner"/>
+    </driver>
+
+    <driver name="ciscoof" extends="default"
+        manufacturer="Cisco Systems, Inc." hwVersion=".*" swVersion="7.0\(3\).*">
+        <behaviour api="org.onosproject.net.behaviour.Pipeliner"
+           impl="org.onosproject.driver.pipeline.CiscoN9kPipeliner" />
+    </driver>
+
 </drivers>
 

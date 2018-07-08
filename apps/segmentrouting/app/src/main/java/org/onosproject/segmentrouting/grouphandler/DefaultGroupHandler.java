@@ -486,7 +486,7 @@ public class DefaultGroupHandler {
                           currNeighbors, nextHops, nextId);
                 if ((revoke && !nextHops.isEmpty())
                         || (!revoke && !nextHops.equals(currNeighbors))) {
-                    log.warn("Simple next objective cannot be edited to "
+                    log.debug("Simple next objective cannot be edited to "
                             + "move from {} to {}", currNeighbors, nextHops);
                 }
                 continue;
@@ -983,6 +983,10 @@ public class DefaultGroupHandler {
                             tBuilder.pushMpls().copyTtlOut()
                                     .setMpls(MplsLabel.mplsLabel(edgeLabel));
                         }
+                    }
+                    if ((ds.getTypeOfDstSet() == DestinationSet.DestinationSetType.SWAP_NOT_BOS) ||
+                         (ds.getTypeOfDstSet() == DestinationSet.DestinationSetType.POP_NOT_BOS)) {
+                        tBuilder.setVlanId(srManager.PSEUDOWIRE_VLAN);
                     }
                     tBuilder.setOutput(sp);
                     nextObjBuilder.addTreatment(tBuilder.build());

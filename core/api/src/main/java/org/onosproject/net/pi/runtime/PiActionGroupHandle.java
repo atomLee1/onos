@@ -63,7 +63,7 @@ public final class PiActionGroupHandle extends PiHandle<PiActionGroup> {
         return Objects.equal(deviceId(), that.deviceId()) &&
                 Objects.equal(piEntity().actionProfileId(),
                               that.piEntity().actionProfileId()) &&
-                Objects.equal(piEntity().id(), piEntity().id());
+                Objects.equal(piEntity().id(), that.piEntity().id());
     }
 
     @Override

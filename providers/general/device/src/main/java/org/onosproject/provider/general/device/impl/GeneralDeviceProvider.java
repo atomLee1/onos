@@ -16,9 +16,13 @@
 
 package org.onosproject.provider.general.device.impl;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.annotations.Beta;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Maps;
+import com.google.common.util.concurrent.Striped;
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.Deactivate;
@@ -32,7 +36,6 @@ import org.onlab.util.Tools;
 import org.onosproject.cfg.ComponentConfigService;
 import org.onosproject.cluster.ClusterService;
 import org.onosproject.cluster.LeadershipService;
-import org.onosproject.cluster.NodeId;
 import org.onosproject.core.CoreService;
 import org.onosproject.mastership.MastershipService;
 import org.onosproject.net.AnnotationKeys;
@@ -41,7 +44,6 @@ import org.onosproject.net.Device;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.MastershipRole;
 import org.onosproject.net.PortNumber;
-import org.onosproject.net.SparseAnnotations;
 import org.onosproject.net.behaviour.PiPipelineProgrammable;
 import org.onosproject.net.behaviour.PortAdmin;
 import org.onosproject.net.config.ConfigFactory;
@@ -51,6 +53,8 @@ import org.onosproject.net.config.NetworkConfigRegistry;
 import org.onosproject.net.config.basics.BasicDeviceConfig;
 import org.onosproject.net.config.basics.SubjectFactories;
 import org.onosproject.net.device.DefaultDeviceDescription;
+import org.onosproject.net.device.DeviceAgentEvent;
+import org.onosproject.net.device.DeviceAgentListener;
 import org.onosproject.net.device.DeviceDescription;
 import org.onosproject.net.device.DeviceDescriptionDiscovery;
 import org.onosproject.net.device.DeviceEvent;
@@ -85,80 +89,106 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Dictionary;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
+import static java.util.concurrent.Executors.newFixedThreadPool;
 import static java.util.concurrent.Executors.newScheduledThreadPool;
+import static java.util.concurrent.Executors.newSingleThreadScheduledExecutor;
 import static org.onlab.util.Tools.groupedThreads;
 import static org.onosproject.net.device.DeviceEvent.Type;
 import static org.slf4j.LoggerFactory.getLogger;
 
 /**
- * Provider which uses drivers to detect device and do initial handshake
- * and channel establishment with devices. Any other provider specific operation
- * is also delegated to the DeviceHandshaker driver.
+ * Provider which uses drivers to detect device and do initial handshake and
+ * channel establishment with devices. Any other provider specific operation is
+ * also delegated to the DeviceHandshaker driver.
  */
 @Beta
 @Component(immediate = true)
 public class GeneralDeviceProvider extends AbstractProvider
         implements DeviceProvider {
-    public static final String DRIVER = "driver";
-    public static final int REACHABILITY_TIMEOUT = 10;
-    public static final String DEPLOY = "deploy-";
-    public static final String PIPECONF_TOPIC = "-pipeconf";
+
+    private static final String DRIVER = "driver";
 
     private final Logger log = getLogger(getClass());
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected DeviceProviderRegistry providerRegistry;
+    private DeviceProviderRegistry providerRegistry;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected ComponentConfigService componentConfigService;
+    private ComponentConfigService componentConfigService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected NetworkConfigRegistry cfgService;
+    private NetworkConfigRegistry cfgService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected CoreService coreService;
+    private CoreService coreService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected DeviceService deviceService;
+    private DeviceService deviceService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected DriverService driverService;
+    private DriverService driverService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected MastershipService mastershipService;
+    private MastershipService mastershipService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected PiPipeconfService piPipeconfService;
+    private PiPipeconfService piPipeconfService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected ClusterService clusterService;
+    private ClusterService clusterService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    protected LeadershipService leadershipService;
+    private LeadershipService leadershipService;
 
-    private static final int DEFAULT_POLL_FREQUENCY_SECONDS = 10;
-    @Property(name = "pollFrequency", intValue = DEFAULT_POLL_FREQUENCY_SECONDS,
+    private static final String STATS_POLL_FREQUENCY = "deviceStatsPollFrequency";
+    private static final int DEFAULT_STATS_POLL_FREQUENCY = 10;
+    @Property(name = STATS_POLL_FREQUENCY, intValue = DEFAULT_STATS_POLL_FREQUENCY,
             label = "Configure poll frequency for port status and statistics; " +
                     "default is 10 sec")
-    private int pollFrequency = DEFAULT_POLL_FREQUENCY_SECONDS;
+    private int statsPollFrequency = DEFAULT_STATS_POLL_FREQUENCY;
 
-    protected static final String APP_NAME = "org.onosproject.generaldeviceprovider";
-    protected static final String URI_SCHEME = "device";
-    protected static final String CFG_SCHEME = "generalprovider";
+    private static final String PROBE_FREQUENCY = "deviceProbeFrequency";
+    private static final int DEFAULT_PROBE_FREQUENCY = 10;
+    @Property(name = PROBE_FREQUENCY, intValue = DEFAULT_PROBE_FREQUENCY,
+            label = "Configure probe frequency for checking device availability; " +
+                    "default is 10 sec")
+    private int probeFrequency = DEFAULT_PROBE_FREQUENCY;
+
+    private static final String OP_TIMEOUT_SHORT = "deviceOperationTimeoutShort";
+    private static final int DEFAULT_OP_TIMEOUT_SHORT = 10;
+    @Property(name = OP_TIMEOUT_SHORT, intValue = DEFAULT_OP_TIMEOUT_SHORT,
+            label = "Configure timeout in seconds for device operations " +
+                    "that are supposed to take a short time " +
+                    "(e.g. checking device reachability); default is 10 seconds")
+    private int opTimeoutShort = DEFAULT_OP_TIMEOUT_SHORT;
+
+    private static final String OP_TIMEOUT_LONG = "deviceOperationTimeoutLong";
+    private static final int DEFAULT_OP_TIMEOUT_LONG = 60;
+    @Property(name = OP_TIMEOUT_LONG, intValue = DEFAULT_OP_TIMEOUT_LONG,
+            label = "Configure timeout in seconds for device operations " +
+                    "that are supposed to take a relatively long time " +
+                    "(e.g. pushing a large pipeline configuration with slow " +
+                    "network); default is 60 seconds")
+    private int opTimeoutLong = DEFAULT_OP_TIMEOUT_LONG;
+
+    private static final String APP_NAME = "org.onosproject.generaldeviceprovider";
+    private static final String URI_SCHEME = "device";
+    private static final String CFG_SCHEME = "generalprovider";
     private static final String DEVICE_PROVIDER_PACKAGE = "org.onosproject.general.provider.device";
     private static final int CORE_POOL_SIZE = 10;
     private static final String UNKNOWN = "unknown";
@@ -166,28 +196,32 @@ public class GeneralDeviceProvider extends AbstractProvider
     //FIXME this will be removed when the configuration is synced at the source.
     private static final Set<String> PIPELINE_CONFIGURABLE_PROTOCOLS = ImmutableSet.of("p4runtime");
 
-    private static final ConcurrentMap<DeviceId, Lock> ENTRY_LOCKS = Maps.newConcurrentMap();
     //FIXME to be removed when netcfg will issue device events in a bundle or
     //ensures all configuration needed is present
     private Set<DeviceId> deviceConfigured = new CopyOnWriteArraySet<>();
     private Set<DeviceId> driverConfigured = new CopyOnWriteArraySet<>();
     private Set<DeviceId> pipelineConfigured = new CopyOnWriteArraySet<>();
 
+    private final Map<DeviceId, DeviceHandshaker> handshakers = Maps.newConcurrentMap();
+    private final Map<DeviceId, MastershipRole> requestedRoles = Maps.newConcurrentMap();
+    private final Striped<Lock> deviceLocks = Striped.lock(30);
 
-    protected ScheduledExecutorService connectionExecutor
-            = newScheduledThreadPool(CORE_POOL_SIZE,
-            groupedThreads("onos/generaldeviceprovider-device",
-                    "connection-executor-%d", log));
-    protected ScheduledExecutorService portStatsExecutor
-            = newScheduledThreadPool(CORE_POOL_SIZE,
-            groupedThreads("onos/generaldeviceprovider-port-stats",
-                    "port-stats-executor-%d", log));
-    protected ConcurrentMap<DeviceId, ScheduledFuture<?>> scheduledTasks = new ConcurrentHashMap<>();
+    private ExecutorService connectionExecutor
+            = newFixedThreadPool(CORE_POOL_SIZE, groupedThreads(
+            "onos/generaldeviceprovider-device-connect", "%d", log));
+    private ScheduledExecutorService statsExecutor
+            = newScheduledThreadPool(CORE_POOL_SIZE, groupedThreads(
+            "onos/generaldeviceprovider-stats-poll", "%d", log));
+    private ConcurrentMap<DeviceId, ScheduledFuture<?>> statsPollingTasks = new ConcurrentHashMap<>();
+    private ScheduledExecutorService probeExecutor
+            = newSingleThreadScheduledExecutor(groupedThreads(
+            "onos/generaldeviceprovider-probe-", "%d", log));
+    private ScheduledFuture<?> probeTask = null;
 
-    protected DeviceProviderService providerService;
+    private DeviceProviderService providerService;
     private InternalDeviceListener deviceListener = new InternalDeviceListener();
 
-    protected final ConfigFactory factory =
+    private final ConfigFactory factory =
             new ConfigFactory<DeviceId, GeneralProviderDeviceConfig>(
                     SubjectFactories.DEVICE_SUBJECT_FACTORY,
                     GeneralProviderDeviceConfig.class, CFG_SCHEME) {
@@ -197,55 +231,77 @@ public class GeneralDeviceProvider extends AbstractProvider
                 }
             };
 
-    protected final NetworkConfigListener cfgListener = new InternalNetworkConfigListener();
+    private final NetworkConfigListener cfgListener = new InternalNetworkConfigListener();
+    private final DeviceAgentListener deviceAgentListener = new InternalDeviceAgentListener();
 
 
     @Activate
-    public void activate() {
+    public void activate(ComponentContext context) {
         providerService = providerRegistry.register(this);
         componentConfigService.registerProperties(getClass());
         coreService.registerApplication(APP_NAME);
         cfgService.registerConfigFactory(factory);
         cfgService.addListener(cfgListener);
         deviceService.addListener(deviceListener);
+        handshakers.clear();
         //This will fail if ONOS has CFG and drivers which depend on this provider
         // are activated, failing due to not finding the driver.
         cfgService.getSubjects(DeviceId.class, GeneralProviderDeviceConfig.class)
-                .forEach(did -> connectionExecutor.execute(() -> connectDevice(did)));
+                .forEach(this::triggerConnect);
+        //Initiating a periodic check to see if any device is available again and reconnect it.
+        rescheduleProbeTask();
+        modified(context);
         log.info("Started");
     }
 
     @Modified
     public void modified(ComponentContext context) {
-        if (context != null) {
-            Dictionary<?, ?> properties = context.getProperties();
-            pollFrequency = Tools.getIntegerProperty(properties, "pollFrequency",
-                    DEFAULT_POLL_FREQUENCY_SECONDS);
-            log.info("Configured. Poll frequency is configured to {} seconds", pollFrequency);
+        if (context == null) {
+            return;
         }
 
-        if (!scheduledTasks.isEmpty()) {
-            //cancel all previous tasks
-            scheduledTasks.values().forEach(task -> task.cancel(false));
-            //resubmit task with new timeout.
-            Set<DeviceId> deviceSubjects =
-                    cfgService.getSubjects(DeviceId.class, GeneralProviderDeviceConfig.class);
-            deviceSubjects.forEach(deviceId -> {
-                if (!compareScheme(deviceId)) {
-                    // not under my scheme, skipping
-                    log.debug("{} is not my scheme, skipping", deviceId);
-                    return;
-                }
-                scheduledTasks.put(deviceId, schedulePolling(deviceId, true));
-            });
+        Dictionary<?, ?> properties = context.getProperties();
+        final int oldStatsPollFrequency = statsPollFrequency;
+        statsPollFrequency = Tools.getIntegerProperty(
+                properties, STATS_POLL_FREQUENCY, DEFAULT_STATS_POLL_FREQUENCY);
+        log.info("Configured. {} is configured to {} seconds",
+                 STATS_POLL_FREQUENCY, statsPollFrequency);
+        final int oldProbeFrequency = probeFrequency;
+        probeFrequency = Tools.getIntegerProperty(
+                properties, PROBE_FREQUENCY, DEFAULT_PROBE_FREQUENCY);
+        log.info("Configured. {} is configured to {} seconds",
+                 PROBE_FREQUENCY, probeFrequency);
+        opTimeoutShort = Tools.getIntegerProperty(
+                properties, OP_TIMEOUT_SHORT, DEFAULT_OP_TIMEOUT_SHORT);
+        log.info("Configured. {} is configured to {} seconds",
+                 OP_TIMEOUT_SHORT, opTimeoutShort);
+        opTimeoutLong = Tools.getIntegerProperty(
+                properties, OP_TIMEOUT_LONG, DEFAULT_OP_TIMEOUT_LONG);
+        log.info("Configured. {} is configured to {} seconds",
+                 OP_TIMEOUT_LONG, opTimeoutLong);
+
+        if (oldStatsPollFrequency != statsPollFrequency) {
+            rescheduleStatsPollingTasks();
         }
 
+        if (oldProbeFrequency != probeFrequency) {
+            rescheduleProbeTask();
+        }
     }
 
+    private synchronized void rescheduleProbeTask() {
+        if (probeTask != null) {
+            probeTask.cancel(false);
+        }
+        probeTask = probeExecutor.scheduleAtFixedRate(
+                this::triggerProbeAllDevices, probeFrequency,
+                probeFrequency, TimeUnit.SECONDS);
+    }
 
     @Deactivate
     public void deactivate() {
-        portStatsExecutor.shutdown();
+        statsExecutor.shutdown();
+        probeExecutor.shutdown();
         componentConfigService.unregisterProperties(getClass(), false);
         cfgService.removeListener(cfgListener);
         //Not Removing the device so they can still be used from other driver providers
@@ -254,6 +310,7 @@ public class GeneralDeviceProvider extends AbstractProvider
         connectionExecutor.shutdown();
         deviceService.removeListener(deviceListener);
         providerRegistry.unregister(this);
+        handshakers.clear();
         providerService = null;
         cfgService.unregisterConfigFactory(factory);
         log.info("Stopped");
@@ -266,121 +323,93 @@ public class GeneralDeviceProvider extends AbstractProvider
 
     @Override
     public void triggerProbe(DeviceId deviceId) {
-        //TODO Really don't see the point of this in non OF Context,
-        // for now testing reachability, can be moved to no-op
-        log.debug("Triggering probe equals testing reachability on device {}", deviceId);
-        isReachable(deviceId);
+        connectionExecutor.execute(withDeviceLock(
+                () -> doDeviceProbe(deviceId), deviceId));
     }
 
     @Override
     public void roleChanged(DeviceId deviceId, MastershipRole newRole) {
         log.info("Received role {} for device {}", newRole, deviceId);
-        CompletableFuture<MastershipRole> roleReply = getHandshaker(deviceId).roleChanged(newRole);
-        roleReply.thenAcceptAsync(mastership -> {
-            providerService.receivedRoleReply(deviceId, newRole, mastership);
-            if (!mastership.equals(MastershipRole.MASTER) && scheduledTasks.get(deviceId) != null) {
-                scheduledTasks.get(deviceId).cancel(false);
-                scheduledTasks.remove(deviceId);
-            } else if (mastership.equals(MastershipRole.MASTER) && scheduledTasks.get(deviceId) == null) {
-                scheduledTasks.put(deviceId, schedulePolling(deviceId, false));
-                updatePortStatistics(deviceId);
-            }
-        });
+        requestedRoles.put(deviceId, newRole);
+        connectionExecutor.execute(() -> doRoleChanged(deviceId, newRole));
+    }
+
+    private void doRoleChanged(DeviceId deviceId, MastershipRole newRole) {
+        final DeviceHandshaker handshaker = getHandshaker(deviceId);
+        if (handshaker == null) {
+            log.error("Null handshaker. Unable to notify new role {} to {}",
+                      newRole, deviceId);
+            return;
+        }
+        handshaker.roleChanged(newRole);
     }
 
     @Override
     public boolean isReachable(DeviceId deviceId) {
         log.debug("Testing reachability for device {}", deviceId);
-
-        DeviceHandshaker handshaker = getHandshaker(deviceId);
+        final DeviceHandshaker handshaker = getHandshaker(deviceId);
         if (handshaker == null) {
             return false;
         }
-
-        CompletableFuture<Boolean> reachable = handshaker.isReachable();
-        try {
-            return reachable.get(REACHABILITY_TIMEOUT, TimeUnit.SECONDS);
-        } catch (InterruptedException | ExecutionException | TimeoutException e) {
-            log.error("Device {} is not reachable", deviceId, e);
-            return false;
-        }
+        return getFutureWithDeadline(
+                handshaker.isReachable(), "checking reachability",
+                deviceId, false, opTimeoutShort);
     }
 
     @Override
     public void changePortState(DeviceId deviceId, PortNumber portNumber,
                                 boolean enable) {
-        if (deviceService.getDevice(deviceId).is(PortAdmin.class)) {
+        connectionExecutor.execute(
+                () -> doChangePortState(deviceId, portNumber, enable));
+    }
 
-            PortAdmin portAdmin = getPortAdmin(deviceId);
-            CompletableFuture<Boolean> modified;
-            if (enable) {
-                modified = portAdmin.enable(portNumber);
-            } else {
-                modified = portAdmin.disable(portNumber);
-            }
-            modified.thenAcceptAsync(result -> {
-                if (!result) {
-                    log.warn("Your device {} port {} status can't be changed to {}",
-                            deviceId, portNumber, enable);
-                }
-            });
-
-        } else {
-            log.warn("Device {} does not support PortAdmin behaviour", deviceId);
+    private void doChangePortState(DeviceId deviceId, PortNumber portNumber,
+                                   boolean enable) {
+        if (!deviceService.getDevice(deviceId).is(PortAdmin.class)) {
+            log.warn("Missing PortAdmin behaviour on {}, aborting port state change",
+                     deviceId);
+            return;
         }
+        final PortAdmin portAdmin = deviceService.getDevice(deviceId)
+                .as(PortAdmin.class);
+        final CompletableFuture<Boolean> modifyTask = enable
+                ? portAdmin.enable(portNumber)
+                : portAdmin.disable(portNumber);
+        final String descr = (enable ? "enabling" : "disabling") + " port " + portNumber;
+        getFutureWithDeadline(
+                modifyTask, descr, deviceId, null, opTimeoutShort);
+    }
+
+    @Override
+    public void triggerDisconnect(DeviceId deviceId) {
+        log.debug("Triggering disconnection of device {}", deviceId);
+        connectionExecutor.execute(withDeviceLock(
+                () -> doDisconnectDevice(deviceId), deviceId));
     }
 
     private DeviceHandshaker getHandshaker(DeviceId deviceId) {
-        Driver driver = getDriver(deviceId);
-        return getBehaviour(driver, DeviceHandshaker.class,
-                new DefaultDriverData(driver, deviceId));
-    }
-
-    private PortAdmin getPortAdmin(DeviceId deviceId) {
-        Driver driver = getDriver(deviceId);
-        return getBehaviour(driver, PortAdmin.class,
-                new DefaultDriverData(driver, deviceId));
-
+        return handshakers.computeIfAbsent(deviceId, id -> {
+            Driver driver = getDriver(deviceId);
+            return driver == null ? null : getBehaviour(
+                    driver, DeviceHandshaker.class,
+                    new DefaultDriverData(driver, deviceId));
+        });
     }
 
     private Driver getDriver(DeviceId deviceId) {
-        Driver driver = null;
         try {
-            driver = driverService.getDriver(deviceId);
+            // DriverManager checks first using basic device config.
+            return driverService.getDriver(deviceId);
         } catch (ItemNotFoundException e) {
-            log.debug("Falling back to configuration to fetch driver " +
-                    "for device {}", deviceId);
-            BasicDeviceConfig cfg = cfgService.getConfig(deviceId, BasicDeviceConfig.class);
-            if (cfg != null) {
-                driver = driverService.getDriver(cfg.driver());
-            }
+            log.error("Driver not found for {}", deviceId);
+            return null;
         }
-        return driver;
     }
 
-    //Distinguishing from getDriver to not impose everywhere the overhead to get the whole device.
-    // This is what the driverService does with the getDriver(deviceId) method.
-    // A redundant method here is needed because the driverService returns null when the device is not in the store
-    // as happens during disconnection.
-    // The whole device object is needed only in disconnection.
-    private Driver getDriverFromAnnotations(Device device) {
-        String driverName = device.annotations().value(DRIVER);
-        if (driverName != null) {
-            try {
-                return driverService.getDriver(driverName);
-            } catch (ItemNotFoundException e) {
-                log.warn("Specified driver {} not found, falling back.", driverName);
-            }
-        }
-        return null;
-    }
-
-    //needed since the device manager will not return the driver through implementation()
-    // method since the device is not pushed to the core so for the connectDevice
-    // we need to work around that in order to test before calling
-    // store.createOrUpdateDevice
     private <T extends Behaviour> T getBehaviour(Driver driver, Class<T> type,
                                                  DriverData data) {
+        // Allows obtaining behavior implementations before the device is pushed
+        // to the core.
         if (driver != null && driver.hasBehaviour(type)) {
             DefaultDriverHandler handler = new DefaultDriverHandler(data);
             return driver.createBehaviour(handler, type);
@@ -389,232 +418,239 @@ public class GeneralDeviceProvider extends AbstractProvider
         }
     }
 
-    //Connects a general device
-    private void connectDevice(DeviceId deviceId) {
-        //retrieve the configuration
-        GeneralProviderDeviceConfig providerConfig =
-                cfgService.getConfig(deviceId, GeneralProviderDeviceConfig.class);
-        BasicDeviceConfig basicDeviceConfig =
-                cfgService.getConfig(deviceId, BasicDeviceConfig.class);
+    private void doConnectDevice(DeviceId deviceId) {
+        // Some operations can be performed by one node only.
+        final boolean isLocalLeader = leadershipService.runForLeadership(
+                GeneralProviderDeviceConfig.class.getName() + deviceId)
+                .leader().nodeId().equals(clusterService.getLocalNode().id());
 
+        if (deviceService.getDevice(deviceId) != null
+                && deviceService.isAvailable(deviceId)) {
+            log.info("Device {} is already connected to ONOS and is available",
+                     deviceId);
+            return;
+        }
+        // Retrieve config
+        final GeneralProviderDeviceConfig providerConfig = cfgService.getConfig(
+                deviceId, GeneralProviderDeviceConfig.class);
+        final BasicDeviceConfig basicDeviceConfig = cfgService.getConfig(
+                deviceId, BasicDeviceConfig.class);
         if (providerConfig == null || basicDeviceConfig == null) {
-            log.error("Configuration is NULL: basic config {}, general provider " +
-                    "config {}", basicDeviceConfig, providerConfig);
-        } else {
-            log.info("Connecting to device {} with driver {}", deviceId, basicDeviceConfig.driver());
-
-            Driver driver;
-            try {
-                driver = driverService.getDriver(basicDeviceConfig.driver());
-            } catch (ItemNotFoundException e) {
-                log.warn("The driver of {} is not found : {}", deviceId, e.getMessage());
-                return;
-            }
-
-            DriverData driverData = new DefaultDriverData(driver, deviceId);
-            DeviceHandshaker handshaker = getBehaviour(driver, DeviceHandshaker.class, driverData);
-            if (handshaker == null) {
-                log.error("Device {}, with driver {} does not support DeviceHandshaker " +
-                        "behaviour, {}", deviceId, driver.name(), driver.behaviours());
-                return;
-            }
-
-            addConfigData(providerConfig, driverData);
-
-            //Connecting to the device
-            CompletableFuture<Boolean> connected = handshaker.connect();
-
-            connected.thenAcceptAsync(result -> {
-                if (result) {
-
-                    //Populated with the default values obtained by the driver
-                    ChassisId cid = new ChassisId();
-                    SparseAnnotations annotations = DefaultAnnotations.builder()
-                            .set(AnnotationKeys.PROTOCOL,
-                                    providerConfig.protocolsInfo().keySet().toString())
-                            .build();
-                    DeviceDescription description =
-                            new DefaultDeviceDescription(deviceId.uri(), Device.Type.SWITCH,
-                                    driver.manufacturer(), driver.hwVersion(),
-                                    driver.swVersion(), UNKNOWN,
-                                    cid, true, annotations);
-                    //Empty list of ports
-                    List<PortDescription> ports = new ArrayList<>();
-
-                    DeviceDescriptionDiscovery deviceDiscovery = getBehaviour(driver,
-                            DeviceDescriptionDiscovery.class, driverData);
-                    if (deviceDiscovery != null) {
-                        DeviceDescription newdescription = deviceDiscovery.discoverDeviceDetails();
-                        if (newdescription != null) {
-                            description = newdescription;
-                        }
-                        ports = deviceDiscovery.discoverPortDetails();
-                    } else {
-                        log.info("No Device Description Discovery for device {}, no update for " +
-                                "description or ports.", deviceId);
-                    }
-
-                    if (!handlePipeconf(deviceId, driver, driverData, true)) {
-                        // Something went wrong during handling of pipeconf.
-                        // We already logged the error.
-                        handshaker.disconnect();
-                        return;
-                    }
-
-                    advertiseDevice(deviceId, description, ports);
-
-                } else {
-                    log.warn("Can't connect to device {}", deviceId);
-                }
-            });
+            log.error("Configuration missing, cannot connect to {}. " +
+                              "basicDeviceConfig={}, generalProvider={}",
+                      deviceId, basicDeviceConfig, providerConfig);
+            return;
+        }
+        log.info("Initiating connection to device {} with driver {} ... asMaster={}",
+                 deviceId, basicDeviceConfig.driver(), isLocalLeader);
+        // Get handshaker, driver and driver data.
+        final DeviceHandshaker handshaker = getHandshaker(deviceId);
+        if (handshaker == null) {
+            log.error("Missing DeviceHandshaker behavior for {}, aborting connection",
+                      deviceId);
+            return;
+        }
+        final Driver driver = handshaker.handler().driver();
+        // Enhance driver data with info in GDP config.
+        augmentConfigData(providerConfig, handshaker.data());
+        final DriverData driverData = handshaker.data();
+        // Start connection via handshaker.
+        final Boolean connectSuccess = getFutureWithDeadline(
+                handshaker.connect(), "initiating connection",
+                deviceId, null, opTimeoutShort);
+        if (connectSuccess == null) {
+            // Error logged by getFutureWithDeadline().
+            return;
+        } else if (!connectSuccess) {
+            log.warn("Unable to connect to {}", deviceId);
+            return;
+        }
+        // Handle pipeconf (if device is capable)
+        if (!handlePipeconf(deviceId, driver, driverData, isLocalLeader)) {
+            // We already logged the error.
+            getFutureWithDeadline(
+                    handshaker.disconnect(), "performing disconnection",
+                    deviceId, null, opTimeoutShort);
+            return;
+        }
+        // Add device agent listener.
+        handshaker.addDeviceAgentListener(deviceAgentListener);
+        // All good. Notify core (if master).
+        if (isLocalLeader) {
+            advertiseDevice(deviceId, driver, providerConfig, driverData);
         }
     }
 
-    private void connectStandbyDevice(DeviceId deviceId) {
 
-        //if device is pipeline programmable we merge pipeconf + base driver for every other role
-        GeneralProviderDeviceConfig providerConfig =
-                cfgService.getConfig(deviceId, GeneralProviderDeviceConfig.class);
+    private void advertiseDevice(DeviceId deviceId, Driver driver,
+                                 GeneralProviderDeviceConfig providerConfig,
+                                 DriverData driverData) {
+        // Obtain device and port description and advertise device to core.
+        DeviceDescription description = null;
+        final List<PortDescription> ports;
 
-        Driver driver = getDriver(deviceId);
+        final DeviceDescriptionDiscovery deviceDiscovery = getBehaviour(
+                driver, DeviceDescriptionDiscovery.class, driverData);
 
-
-        DriverData driverData = new DefaultDriverData(driver, deviceId);
-        DeviceHandshaker handshaker = getBehaviour(driver, DeviceHandshaker.class, driverData);
-        if (handshaker == null) {
-            log.error("Device {}, with driver {} does not support DeviceHandshaker " +
-                    "behaviour, supported behaviours={}", deviceId, driver.name(), driver.behaviours());
-            return;
+        if (deviceDiscovery != null) {
+            description = deviceDiscovery.discoverDeviceDetails();
+            ports = deviceDiscovery.discoverPortDetails();
+        } else {
+            log.warn("Missing DeviceDescriptionDiscovery behavior for {}, " +
+                             "no update for description or ports.", deviceId);
+            ports = new ArrayList<>();
         }
-        addConfigData(providerConfig, driverData);
 
-        //Connecting to the device
-        handshaker.connect().thenAcceptAsync(result -> {
-            if (result) {
-                handlePipeconf(deviceId, driver, driverData, false);
-            }
-        });
+        if (description == null) {
+            // Generate one here.
+            // FIXME: a behavior impl should not return a null description
+            // (e.g. as GnmiDeviceDescriptionDiscovery). This case should apply
+            // only if a the behavior is not available.
+            description = new DefaultDeviceDescription(
+                    deviceId.uri(), Device.Type.SWITCH,
+                    driver.manufacturer(), driver.hwVersion(),
+                    driver.swVersion(), UNKNOWN,
+                    new ChassisId(), true,
+                    DefaultAnnotations.builder()
+                            .set(AnnotationKeys.PROTOCOL,
+                                 providerConfig.protocolsInfo().keySet().toString())
+                            .build());
+        }
+
+        providerService.deviceConnected(deviceId, description);
+        providerService.updatePorts(deviceId, ports);
     }
 
     /**
-     * Handles the case of a device that is pipeline programmable. Returns true if the operation wa successful and the
-     * device can be registered to the core, false otherwise.
+     * Handles the case of a device that is pipeline programmable. Returns true
+     * if the operation wa successful and the device can be registered to the
+     * core, false otherwise.
      */
-    private boolean handlePipeconf(DeviceId deviceId, Driver driver, DriverData driverData, boolean deployPipeconf) {
-
-        PiPipelineProgrammable pipelineProg = getBehaviour(driver, PiPipelineProgrammable.class,
-                driverData);
-
+    private boolean handlePipeconf(DeviceId deviceId, Driver driver,
+                                   DriverData driverData, boolean asMaster) {
+        final PiPipelineProgrammable pipelineProg = getBehaviour(
+                driver, PiPipelineProgrammable.class, driverData);
         if (pipelineProg == null) {
             // Device is not pipeline programmable.
             return true;
         }
 
-        PiPipeconf pipeconf = getPipeconf(deviceId, pipelineProg);
+        final PiPipeconf pipeconf = getPipeconf(deviceId, pipelineProg);
+        if (pipeconf == null) {
+            return false;
+        }
+        final PiPipeconfId pipeconfId = pipeconf.id();
 
-        if (pipeconf != null) {
+        final String mergedDriverName = piPipeconfService.mergeDriver(
+                deviceId, pipeconfId);
+        if (mergedDriverName == null) {
+            log.error("Unable to get merged driver for {} and {}, aborting device discovery",
+                      deviceId, pipeconfId);
+            return false;
+        }
 
-            PiPipeconfId pipeconfId = pipeconf.id();
+        if (!asMaster) {
+            // From now one only the master.
+            return true;
+        }
 
-            try {
-                if (deployPipeconf) {
-                    if (!pipelineProg.deployPipeconf(pipeconf).get()) {
-                        log.error("Unable to deploy pipeconf {} to {}, aborting device discovery",
-                                pipeconfId, deviceId);
-                        return false;
-                    }
-                }
-            } catch (InterruptedException | ExecutionException e) {
-                log.warn("Exception occurred while deploying pipeconf {} to device {}", pipeconf.id(), deviceId, e);
-                return false;
-            }
-            try {
-                if (!piPipeconfService.bindToDevice(pipeconfId, deviceId).get()) {
-                    log.error("Unable to merge driver {} for device {} with pipeconf {}, aborting device discovery",
-                            driver.name(), deviceId, pipeconfId);
-                    return false;
-                }
-            } catch (InterruptedException | ExecutionException e) {
-                log.warn("Exception occurred while binding pipeconf {} to device {}", pipeconf.id(), deviceId, e);
-                return false;
-            }
-        } else {
+        if (!setDriverViaCfg(deviceId, mergedDriverName)) {
+            return false;
+        }
+
+        // FIXME: we just introduced a race condition as it might happen that a
+        // node does not receive the new cfg (with the merged driver) before the
+        // device is advertised to the core. Perhaps we should be waiting for a
+        // NetworkConfig event signaling that the driver has been updated on all
+        // nodes? The effect is mitigated by deploying the pipeconf (slow
+        // operation), after calling setDriverViaCfg().
+
+        piPipeconfService.bindToDevice(pipeconfId, deviceId);
+
+        final Boolean deploySuccess = getFutureWithDeadline(
+                pipelineProg.deployPipeconf(pipeconf),
+                "deploying pipeconf", deviceId, null,
+                opTimeoutLong);
+        if (deploySuccess == null) {
+            // Error logged by getFutureWithDeadline().
+            return false;
+        } else if (!deploySuccess) {
+            log.error("Unable to deploy pipeconf {} to {}, aborting device discovery",
+                      pipeconfId, deviceId);
             return false;
         }
 
         return true;
     }
 
+    private boolean setDriverViaCfg(DeviceId deviceId, String driverName) {
+        BasicDeviceConfig cfg = cfgService.getConfig(deviceId, BasicDeviceConfig.class);
+        if (cfg == null) {
+            log.error("Unable to get basic device config for {}, aborting device discovery",
+                      deviceId);
+            return false;
+        }
+        ObjectNode newCfg = (ObjectNode) cfg.node();
+        newCfg = newCfg.put(DRIVER, driverName);
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode newCfgNode = mapper.convertValue(newCfg, JsonNode.class);
+        cfgService.applyConfig(deviceId, BasicDeviceConfig.class, newCfgNode);
+        return true;
+    }
+
     private PiPipeconf getPipeconf(DeviceId deviceId, PiPipelineProgrammable pipelineProg) {
-        PiPipeconfId pipeconfId = piPipeconfService.ofDevice(deviceId).orElseGet(() -> {
-            // No pipeconf has been associated with this device.
+        PiPipeconfId pipeconfId = getPipeconfFromCfg(deviceId);
+        if (pipeconfId == null || pipeconfId.id().isEmpty()) {
+            // No pipeconf has been provided in the cfg.
             // Check if device driver provides a default one.
             if (pipelineProg.getDefaultPipeconf().isPresent()) {
-                PiPipeconf defaultPipeconf = pipelineProg.getDefaultPipeconf().get();
+                final PiPipeconf defaultPipeconf = pipelineProg.getDefaultPipeconf().get();
                 log.info("Using default pipeconf {} for {}", defaultPipeconf.id(), deviceId);
-                return defaultPipeconf.id();
+                pipeconfId = defaultPipeconf.id();
             } else {
+                log.warn("Device {} is pipeline programmable but no pipeconf can be associated to it", deviceId);
                 return null;
             }
-        });
-
-        if (pipeconfId == null) {
-            log.warn("Device {} is pipeline programmable but no pipeconf can be associated to it.", deviceId);
-            return null;
         }
-
+        // Check if registered
         if (!piPipeconfService.getPipeconf(pipeconfId).isPresent()) {
             log.warn("Pipeconf {} is not registered", pipeconfId);
             return null;
         }
-
-
         return piPipeconfService.getPipeconf(pipeconfId).get();
     }
 
-    private void advertiseDevice(DeviceId deviceId, DeviceDescription description, List<PortDescription> ports) {
-        providerService.deviceConnected(deviceId, description);
-        providerService.updatePorts(deviceId, ports);
-    }
-
-    private void disconnectDevice(Device device) {
-        DeviceId deviceId = device.id();
-        log.info("Disconnecting for device {}", deviceId);
-
-        //The driver service will return a null driver for the given deviceId
-        //since it's already removed form the device store, we leverage the device object from the DEVICE_REMOVED
-        //event to get the driver.
-        Driver driver = getDriverFromAnnotations(device);
-        if (driver != null) {
-            DeviceHandshaker handshaker = getBehaviour(driver, DeviceHandshaker.class,
-                    new DefaultDriverData(driver, deviceId));
-            if (handshaker != null) {
-                CompletableFuture<Boolean> disconnect = handshaker.disconnect();
-                disconnect.thenAcceptAsync(result -> {
-                    if (result) {
-                        log.info("Disconnected device {}", deviceId);
-                        providerService.deviceDisconnected(deviceId);
-                    } else {
-                        log.warn("Device {} was unable to disconnect", deviceId);
-                    }
-                });
-            } else {
-                //gracefully ignoring.
-                log.warn("No DeviceHandshaker for device {}, no guarantees of complete " +
-                        "shutdown of communication", deviceId);
+    private void doDisconnectDevice(DeviceId deviceId) {
+        log.debug("Initiating disconnection from {}...", deviceId);
+        final DeviceHandshaker handshaker = handshakers.remove(deviceId);
+        final boolean isAvailable = deviceService.isAvailable(deviceId);
+        // Signal disconnection to core (if master).
+        if (isAvailable && mastershipService.isLocalMaster(deviceId)) {
+            providerService.deviceDisconnected(deviceId);
+        }
+        // Cancel tasks.
+        cancelStatsPolling(deviceId);
+        // Disconnect device.
+        if (handshaker == null) {
+            if (isAvailable) {
+                // If not available don't bother logging. We are probably
+                // invoking this method multiple times for the same device.
+                log.warn("Missing DeviceHandshaker behavior for {}, " +
+                                 "no guarantees of complete disconnection",
+                         deviceId);
             }
-        } else {
-            //gracefully ignoring.
-            log.warn("Can't find driver for device {}, no guarantees of complete shutdown of communication", deviceId);
+            return;
         }
-        ScheduledFuture<?> pollingStatisticsTask = scheduledTasks.get(deviceId);
-        if (pollingStatisticsTask != null) {
-            pollingStatisticsTask.cancel(true);
+        handshaker.removeDeviceAgentListener(deviceAgentListener);
+        final boolean disconnectSuccess = getFutureWithDeadline(
+                handshaker.disconnect(), "performing disconnection",
+                deviceId, false, opTimeoutShort);
+        if (!disconnectSuccess) {
+            log.warn("Unable to disconnect from {}", deviceId);
         }
-
     }
 
-    //Needed to catch the exception in the executors since are not rethrown otherwise.
+    // Needed to catch the exception in the executors since are not rethrown otherwise.
     private Runnable exceptionSafe(Runnable runnable) {
         return () -> {
             try {
@@ -625,9 +661,27 @@ public class GeneralDeviceProvider extends AbstractProvider
         };
     }
 
+    private <U> U withDeviceLock(Supplier<U> task, DeviceId deviceId) {
+        final Lock lock = deviceLocks.get(deviceId);
+        lock.lock();
+        try {
+            return task.get();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private Runnable withDeviceLock(Runnable task, DeviceId deviceId) {
+        // Wrapper of withDeviceLock(Supplier, ...) for void tasks.
+        return () -> withDeviceLock(() -> {
+            task.run();
+            return null;
+        }, deviceId);
+    }
+
     private void updatePortStatistics(DeviceId deviceId) {
         Device device = deviceService.getDevice(deviceId);
-        if (!Objects.isNull(device) && deviceService.isAvailable(deviceId) &&
+        if (device != null && deviceService.isAvailable(deviceId) &&
                 device.is(PortStatisticsDiscovery.class)) {
             Collection<PortStatistics> statistics = device.as(PortStatisticsDiscovery.class)
                     .discoverPortStatistics();
@@ -640,8 +694,13 @@ public class GeneralDeviceProvider extends AbstractProvider
         }
     }
 
-    private boolean compareScheme(DeviceId deviceId) {
-        return deviceId.uri().getScheme().equals(URI_SCHEME);
+    private boolean notMyScheme(DeviceId deviceId) {
+        return !deviceId.uri().getScheme().equals(URI_SCHEME);
+    }
+
+    private void triggerConnect(DeviceId deviceId) {
+        connectionExecutor.execute(withDeviceLock(
+                () -> doConnectDevice(deviceId), deviceId));
     }
 
     /**
@@ -649,90 +708,9 @@ public class GeneralDeviceProvider extends AbstractProvider
      */
     private class InternalNetworkConfigListener implements NetworkConfigListener {
 
-
         @Override
         public void event(NetworkConfigEvent event) {
-            DeviceId deviceId = (DeviceId) event.subject();
-            //Assuming that the deviceId comes with uri 'device:'
-            if (!compareScheme(deviceId)) {
-                // not under my scheme, skipping
-                log.debug("{} is not my scheme, skipping", deviceId);
-                return;
-            }
-            if (deviceService.getDevice(deviceId) != null && deviceService.isAvailable(deviceId)) {
-                log.info("Device {} is already connected to ONOS and is available", deviceId);
-                return;
-            }
-            NodeId leaderNodeId = leadershipService.runForLeadership(DEPLOY + deviceId.toString() + PIPECONF_TOPIC)
-                    .leader().nodeId();
-            NodeId localNodeId = clusterService.getLocalNode().id();
-            if (localNodeId.equals(leaderNodeId)) {
-                if (processEvent(event, deviceId)) {
-                    log.debug("{} is leader for {}, initiating the connection and deploying pipeline", leaderNodeId,
-                            deviceId);
-                    checkAndSubmitDeviceTask(deviceId);
-                }
-            } else {
-                if (processEvent(event, deviceId)) {
-                    log.debug("{} is not leader for {}, initiating connection but not deploying pipeline, {} is LEADER",
-                            localNodeId, deviceId, leaderNodeId);
-                    connectionExecutor.submit(exceptionSafe(() -> connectStandbyDevice(deviceId)));
-                    //FIXME this will be removed when config is synced
-                    cleanUpConfigInfo(deviceId);
-                }
-            }
-
-        }
-
-        private boolean processEvent(NetworkConfigEvent event, DeviceId deviceId) {
-            //FIXME to be removed when netcfg will issue device events in a bundle or
-            // ensure all configuration needed is present
-            Lock lock = ENTRY_LOCKS.computeIfAbsent(deviceId, key -> new ReentrantLock());
-            lock.lock();
-            try {
-                if (event.configClass().equals(GeneralProviderDeviceConfig.class)) {
-                    //FIXME we currently assume that p4runtime devices are pipeline configurable.
-                    //If we want to connect a p4runtime device with no pipeline
-                    if (event.config().isPresent() &&
-                            Collections.disjoint(ImmutableSet.copyOf(event.config().get().node().fieldNames()),
-                                    PIPELINE_CONFIGURABLE_PROTOCOLS)) {
-                        pipelineConfigured.add(deviceId);
-                    }
-                    deviceConfigured.add(deviceId);
-                } else if (event.configClass().equals(BasicDeviceConfig.class)) {
-                    if (event.config().isPresent() && event.config().get().node().has(DRIVER)) {
-                        //TODO add check for pipeline and add it to the pipeline list if no
-                        // p4runtime is present.
-                        driverConfigured.add(deviceId);
-                    }
-                } else if (event.configClass().equals(PiPipeconfConfig.class)) {
-                    if (event.config().isPresent()
-                            && event.config().get().node().has(PiPipeconfConfig.PIPIPECONFID)) {
-                        pipelineConfigured.add(deviceId);
-                    }
-                }
-                //if the device has no "pipeline configurable protocol it will be present
-                // in the pipelineConfigured
-                if (deviceConfigured.contains(deviceId) && driverConfigured.contains(deviceId)
-                        && pipelineConfigured.contains(deviceId)) {
-                    return true;
-                } else {
-                    if (deviceConfigured.contains(deviceId) && driverConfigured.contains(deviceId)) {
-                        log.debug("Waiting for pipeline configuration for device {}", deviceId);
-                    } else if (pipelineConfigured.contains(deviceId) && driverConfigured.contains(deviceId)) {
-                        log.debug("Waiting for device configuration for device {}", deviceId);
-                    } else if (pipelineConfigured.contains(deviceId) && deviceConfigured.contains(deviceId)) {
-                        log.debug("Waiting for driver configuration for device {}", deviceId);
-                    } else if (driverConfigured.contains(deviceId)) {
-                        log.debug("Only driver configuration for device {}", deviceId);
-                    } else if (deviceConfigured.contains(deviceId)) {
-                        log.debug("Only device configuration for device {}", deviceId);
-                    }
-                }
-                return false;
-            } finally {
-                lock.unlock();
-            }
+            connectionExecutor.execute(() -> consumeConfigEvent(event));
         }
 
         @Override
@@ -743,16 +721,75 @@ public class GeneralDeviceProvider extends AbstractProvider
                     (event.type() == NetworkConfigEvent.Type.CONFIG_ADDED ||
                             event.type() == NetworkConfigEvent.Type.CONFIG_UPDATED);
         }
+
+        private void consumeConfigEvent(NetworkConfigEvent event) {
+            DeviceId deviceId = (DeviceId) event.subject();
+            //Assuming that the deviceId comes with uri 'device:'
+            if (notMyScheme(deviceId)) {
+                // not under my scheme, skipping
+                log.debug("{} is not my scheme, skipping", deviceId);
+                return;
+            }
+            final boolean configComplete = withDeviceLock(
+                    () -> isDeviceConfigComplete(event, deviceId), deviceId);
+            if (!configComplete) {
+                // Still waiting for some configuration.
+                return;
+            }
+            // Good to go.
+            triggerConnect(deviceId);
+            cleanUpConfigInfo(deviceId);
+        }
+
+        private boolean isDeviceConfigComplete(NetworkConfigEvent event, DeviceId deviceId) {
+            // FIXME to be removed when netcfg will issue device events in a bundle or
+            // ensure all configuration needed is present
+            if (event.configClass().equals(GeneralProviderDeviceConfig.class)) {
+                //FIXME we currently assume that p4runtime devices are pipeline configurable.
+                //If we want to connect a p4runtime device with no pipeline
+                if (event.config().isPresent()) {
+                    deviceConfigured.add(deviceId);
+                    final boolean isNotPipelineConfigurable = Collections.disjoint(
+                            ImmutableSet.copyOf(event.config().get().node().fieldNames()),
+                            PIPELINE_CONFIGURABLE_PROTOCOLS);
+                    if (isNotPipelineConfigurable) {
+                        // Skip waiting for a pipeline if we can't support it.
+                        pipelineConfigured.add(deviceId);
+                    }
+                }
+            } else if (event.configClass().equals(BasicDeviceConfig.class)) {
+                if (event.config().isPresent() && event.config().get().node().has(DRIVER)) {
+                    driverConfigured.add(deviceId);
+                }
+            } else if (event.configClass().equals(PiPipeconfConfig.class)) {
+                if (event.config().isPresent()
+                        && event.config().get().node().has(PiPipeconfConfig.PIPIPECONFID)) {
+                    pipelineConfigured.add(deviceId);
+                }
+            }
+
+            if (deviceConfigured.contains(deviceId)
+                    && driverConfigured.contains(deviceId)
+                    && pipelineConfigured.contains(deviceId)) {
+                return true;
+            } else {
+                if (deviceConfigured.contains(deviceId) && driverConfigured.contains(deviceId)) {
+                    log.debug("Waiting for pipeline configuration for device {}", deviceId);
+                } else if (pipelineConfigured.contains(deviceId) && driverConfigured.contains(deviceId)) {
+                    log.debug("Waiting for device configuration for device {}", deviceId);
+                } else if (pipelineConfigured.contains(deviceId) && deviceConfigured.contains(deviceId)) {
+                    log.debug("Waiting for driver configuration for device {}", deviceId);
+                } else if (driverConfigured.contains(deviceId)) {
+                    log.debug("Only driver configuration for device {}", deviceId);
+                } else if (deviceConfigured.contains(deviceId)) {
+                    log.debug("Only device configuration for device {}", deviceId);
+                }
+            }
+            return false;
+        }
     }
 
-    private void checkAndSubmitDeviceTask(DeviceId deviceId) {
-        connectionExecutor.submit(exceptionSafe(() -> connectDevice(deviceId)));
-        //FIXME this will be removed when configuration is synced.
-        cleanUpConfigInfo(deviceId);
-
-    }
-
-    private void addConfigData(GeneralProviderDeviceConfig providerConfig, DriverData driverData) {
+    private void augmentConfigData(GeneralProviderDeviceConfig providerConfig, DriverData driverData) {
         //Storing deviceKeyId and all other config values
         // as data in the driver with protocol_<info>
         // name as the key. e.g protocol_ip
@@ -770,14 +807,116 @@ public class GeneralDeviceProvider extends AbstractProvider
         pipelineConfigured.remove(deviceId);
     }
 
-    private ScheduledFuture<?> schedulePolling(DeviceId deviceId, boolean randomize) {
-        int delay = 0;
-        if (randomize) {
-            delay = new SecureRandom().nextInt(10);
+    private void startStatsPolling(DeviceId deviceId, boolean withRandomDelay) {
+        statsPollingTasks.compute(deviceId, (did, oldTask) -> {
+            if (oldTask != null) {
+                oldTask.cancel(false);
+            }
+            final int delay = withRandomDelay
+                    ? new SecureRandom().nextInt(10) : 0;
+            return statsExecutor.scheduleAtFixedRate(
+                    exceptionSafe(() -> updatePortStatistics(deviceId)),
+                    delay, statsPollFrequency, TimeUnit.SECONDS);
+        });
+    }
+
+    private void cancelStatsPolling(DeviceId deviceId) {
+        statsPollingTasks.computeIfPresent(deviceId, (did, task) -> {
+            task.cancel(false);
+            return null;
+        });
+    }
+
+    private void rescheduleStatsPollingTasks() {
+        statsPollingTasks.keySet().forEach(deviceId -> {
+            // startStatsPolling cancels old one if present.
+            startStatsPolling(deviceId, true);
+        });
+    }
+
+    private void triggerProbeAllDevices() {
+        // Async trigger a task for all devices in the cfg.
+        cfgService.getSubjects(DeviceId.class, GeneralProviderDeviceConfig.class)
+                .forEach(deviceId -> connectionExecutor.execute(withDeviceLock(
+                        () -> doDeviceProbe(deviceId), deviceId)));
+    }
+
+    private PiPipeconfId getPipeconfFromCfg(DeviceId deviceId) {
+        PiPipeconfConfig config = cfgService.getConfig(
+                deviceId, PiPipeconfConfig.class);
+        if (config == null) {
+            return null;
         }
-        return portStatsExecutor.scheduleAtFixedRate(
-                exceptionSafe(() -> updatePortStatistics(deviceId)),
-                delay, pollFrequency, TimeUnit.SECONDS);
+        return config.piPipeconfId();
+    }
+
+    private void doDeviceProbe(DeviceId deviceId) {
+        if (!configIsPresent(deviceId)) {
+            return;
+        }
+        final boolean isAvailable = deviceService.getDevice(deviceId) != null
+                && deviceService.isAvailable(deviceId);
+        final boolean isLocalMaster = mastershipService.isLocalMaster(deviceId);
+        if (isAvailable) {
+            if (!isLocalMaster) {
+                return;
+            }
+            if (!isReachable(deviceId)) {
+                log.info("Disconnecting available but unreachable device {}...",
+                         deviceId);
+                triggerDisconnect(deviceId);
+            }
+        } else {
+            // We do not check for reachability using isReachable()
+            // since the behaviour of this method can vary depending on protocol
+            // nuances. We leave this check to the device handshaker at later
+            // stages of the connection process.
+            triggerConnect(deviceId);
+        }
+    }
+
+    private boolean configIsPresent(DeviceId deviceId) {
+        final boolean present =
+                cfgService.getConfig(deviceId, GeneralProviderDeviceConfig.class) != null
+                        && cfgService.getConfig(deviceId, BasicDeviceConfig.class) != null;
+        if (!present) {
+            log.warn("Configuration for device {} is not complete", deviceId);
+        }
+        return present;
+    }
+
+    private void handleChannelClosed(DeviceId deviceId) {
+        log.info("Disconnecting device {}, due to channel closed event",
+                 deviceId);
+        triggerDisconnect(deviceId);
+    }
+
+    private void handleMastershipResponse(DeviceId deviceId, MastershipRole response) {
+        //Notify core about response.
+        if (!requestedRoles.containsKey(deviceId)) {
+            return;
+        }
+        providerService.receivedRoleReply(deviceId, requestedRoles.get(deviceId), response);
+        if (response.equals(MastershipRole.MASTER)) {
+            startStatsPolling(deviceId, false);
+        } else {
+            cancelStatsPolling(deviceId);
+        }
+    }
+
+    private <U> U getFutureWithDeadline(CompletableFuture<U> future, String opDescription,
+                                        DeviceId deviceId, U defaultValue, int timeout) {
+        try {
+            return future.get(timeout, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            log.error("Thread interrupted while {} on {}", opDescription, deviceId);
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            log.error("Exception while {} on {}", opDescription, deviceId, e.getCause());
+        } catch (TimeoutException e) {
+            log.error("Operation TIMEOUT while {} on {}", opDescription, deviceId);
+        }
+        return defaultValue;
     }
 
     /**
@@ -786,28 +925,54 @@ public class GeneralDeviceProvider extends AbstractProvider
     private class InternalDeviceListener implements DeviceListener {
         @Override
         public void event(DeviceEvent event) {
-            Type type = event.type();
             DeviceId deviceId = event.subject().id();
-            if (type.equals((Type.DEVICE_ADDED))) {
-
-                // FIXME handling for mastership change scenario missing?
-
-                //For now this is scheduled periodically, when streaming API will
-                // be available we check and base it on the streaming API (e.g. gNMI)
-                if (mastershipService.isLocalMaster(deviceId)) {
-                    scheduledTasks.put(deviceId, schedulePolling(deviceId, false));
-                }
-
-            } else if (type.equals(Type.DEVICE_REMOVED)) {
-
-                //Passing the whole device object to get driver information
-                connectionExecutor.execute(() -> disconnectDevice(event.subject()));
+            // For now this is scheduled periodically, when streaming API will
+            // be available we check and base it on the streaming API (e.g. gNMI)
+            if (mastershipService.isLocalMaster(deviceId)) {
+                startStatsPolling(deviceId, true);
             }
         }
 
         @Override
         public boolean isRelevant(DeviceEvent event) {
-            return event.subject().id().toString().startsWith(URI_SCHEME.toLowerCase());
+            return event.type() == Type.DEVICE_ADDED &&
+                    event.subject().id().toString().startsWith(URI_SCHEME.toLowerCase());
         }
+    }
+
+    /**
+     * Listener for device agent events.
+     */
+    private class InternalDeviceAgentListener implements DeviceAgentListener {
+
+        @Override
+        public void event(DeviceAgentEvent event) {
+            DeviceId deviceId = event.subject();
+            switch (event.type()) {
+                case CHANNEL_OPEN:
+                    // Ignore.
+                    break;
+                case CHANNEL_CLOSED:
+                    handleChannelClosed(deviceId);
+                    break;
+                case CHANNEL_ERROR:
+                    // TODO evaluate other reaction to channel error.
+                    log.warn("Received CHANNEL_ERROR from {}. Is the channel still open?",
+                             deviceId);
+                    break;
+                case ROLE_MASTER:
+                    handleMastershipResponse(deviceId, MastershipRole.MASTER);
+                    break;
+                case ROLE_STANDBY:
+                    handleMastershipResponse(deviceId, MastershipRole.STANDBY);
+                    break;
+                case ROLE_NONE:
+                    handleMastershipResponse(deviceId, MastershipRole.NONE);
+                    break;
+                default:
+                    log.warn("Unrecognized device agent event {}", event.type());
+            }
+        }
+
     }
 }

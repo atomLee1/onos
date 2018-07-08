@@ -17,49 +17,63 @@
 package org.onosproject.p4runtime.api;
 
 import com.google.common.annotations.Beta;
-import io.grpc.ManagedChannelBuilder;
 import org.onosproject.event.ListenerService;
 import org.onosproject.net.DeviceId;
+import org.onosproject.net.device.DeviceAgentListener;
 
 /**
  * Controller of P4Runtime devices.
  */
 @Beta
-public interface P4RuntimeController extends ListenerService<P4RuntimeEvent, P4RuntimeEventListener> {
+public interface P4RuntimeController
+        extends ListenerService<P4RuntimeEvent, P4RuntimeEventListener> {
 
     /**
-     * Instantiates a new client to operate on the device identified by the given information and reachable using the
-     * given gRPC channel builder. As a result of this method, a {@link P4RuntimeClient} can be later obtained by
-     * invoking {@link #getClient(DeviceId)}. Only one client can exist for the same device identifier. Returns true if
-     * the client was created and the channel to the device is open, false otherwise.
+     * Instantiates a new client to operate on a P4Runtime device identified by
+     * the given information. As a result of this method, a {@link
+     * P4RuntimeClient} can be later obtained by invoking {@link
+     * #getClient(DeviceId)}. Returns true if the client was created and the
+     * channel to the device is open, false otherwise.
+     * <p>
+     * Only one client can exist for the same device ID. Calls to this method
+     * are idempotent for the same [device ID, address, port, p4DeviceId]
+     * triplet, i.e. returns true if such client already exists but a new one is
+     * not created. Throws an {@link IllegalStateException} if a client for
+     * device ID already exists but for different [address, port, p4DeviceId].
      *
-     * @param deviceId       device identifier
-     * @param p4DeviceId     P4Runtime-specific device identifier
-     * @param channelBuilder gRPC channel builder pointing at the P4Runtime server in execution on the device
-     * @return true if the client was created and the channel to the device is open
-     * @throws IllegalStateException if a client already exists for the given device identifier
+     * @param deviceId   device identifier
+     * @param serverAddr address of the P4Runtime server
+     * @param serverPort port of the P4Runtime server
+     * @param p4DeviceId P4Runtime-specific device identifier
+     * @return true if the client was created and the channel to the device is
+     * open
+     * @throws IllegalStateException if a client already exists for this device
+     *                               ID but for different [address, port,
+     *                               p4DeviceId] triplet.
      */
-    boolean createClient(DeviceId deviceId, long p4DeviceId, ManagedChannelBuilder channelBuilder);
+    boolean createClient(DeviceId deviceId, String serverAddr, int serverPort,
+                         long p4DeviceId);
 
     /**
-     * Returns a client to operate on the given device.
+     * Returns a client to operate on the given device, or null if a client for
+     * such device does not exist in this controller.
      *
      * @param deviceId device identifier
-     * @return client instance
-     * @throws IllegalStateException if no client exists for the given device identifier
+     * @return client instance or null
      */
     P4RuntimeClient getClient(DeviceId deviceId);
 
     /**
-     * Removes the client for the given device. If no client exists for the given device identifier, the
-     * result is a no-op.
+     * Removes the client for the given device. If no client exists for the
+     * given device identifier, the result is a no-op.
      *
      * @param deviceId device identifier
      */
     void removeClient(DeviceId deviceId);
 
     /**
-     * Returns true if a client exists for the given device identifier, false otherwise.
+     * Returns true if a client exists for the given device identifier, false
+     * otherwise.
      *
      * @param deviceId device identifier
      * @return true if client exists, false otherwise.
@@ -67,19 +81,31 @@ public interface P4RuntimeController extends ListenerService<P4RuntimeEvent, P4R
     boolean hasClient(DeviceId deviceId);
 
     /**
-     * Returns true if the P4Runtime server running on the given device is reachable, i.e. the channel is open and the
-     * server is able to respond to RPCs, false otherwise. Reachability can be tested only if a client was previously
-     * created using {@link #createClient(DeviceId, long, ManagedChannelBuilder)}, otherwise this method returns false.
+     * Returns true if the P4Runtime server running on the given device is
+     * reachable, i.e. the channel is open and the server is able to respond to
+     * RPCs, false otherwise. Reachability can be tested only if a client was
+     * previously created using {@link #createClient(DeviceId, String, int,
+     * long)}, otherwise this method returns false.
      *
      * @param deviceId device identifier.
-     * @return true if a client was created and is able to contact the P4Runtime server, false otherwise.
+     * @return true if a client was created and is able to contact the P4Runtime
+     * server, false otherwise.
      */
-    boolean isReacheable(DeviceId deviceId);
+    boolean isReachable(DeviceId deviceId);
 
     /**
-     * Gets new election id for device arbitration request.
+     * Adds a listener for device agent events.
      *
-     * @return the election id
+     * @param deviceId device identifier
+     * @param listener the device agent listener
      */
-    long getNewMasterElectionId();
+    void addDeviceAgentListener(DeviceId deviceId, DeviceAgentListener listener);
+
+    /**
+     * Removes the listener for device agent events.
+     *
+     * @param deviceId device identifier
+     * @param listener the device agent listener
+     */
+    void removeDeviceAgentListener(DeviceId deviceId, DeviceAgentListener listener);
 }

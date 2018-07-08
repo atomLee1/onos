@@ -17,6 +17,7 @@ package org.onosproject.driver.pipeline.ofdpa;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import org.onlab.packet.EthType;
 import org.onlab.packet.Ethernet;
 import org.onlab.packet.IpAddress;
 import org.onlab.packet.IpPrefix;
@@ -24,6 +25,7 @@ import org.onlab.packet.MacAddress;
 import org.onlab.packet.VlanId;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.GroupId;
+import org.onosproject.net.DeviceId;
 import org.onosproject.net.Port;
 import org.onosproject.net.PortNumber;
 import org.onosproject.net.behaviour.NextGroup;
@@ -49,6 +51,7 @@ import org.onosproject.net.flow.criteria.PortCriterion;
 import org.onosproject.net.flow.criteria.VlanIdCriterion;
 import org.onosproject.net.flow.instructions.Instruction;
 import org.onosproject.net.flow.instructions.Instructions.OutputInstruction;
+import org.onosproject.net.flow.instructions.Instructions.NoActionInstruction;
 import org.onosproject.net.flow.instructions.L3ModificationInstruction;
 import org.onosproject.net.flowobjective.ForwardingObjective;
 import org.onosproject.net.flowobjective.ObjectiveError;
@@ -69,10 +72,17 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import java.util.Objects;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.onlab.packet.IPv6.PROTOCOL_ICMP6;
 import static org.onlab.packet.MacAddress.BROADCAST;
 import static org.onlab.packet.MacAddress.NONE;
+import static org.onlab.util.Tools.groupedThreads;
 import static org.onosproject.driver.pipeline.ofdpa.OfdpaGroupHandlerUtility.*;
 import static org.slf4j.LoggerFactory.getLogger;
 
@@ -106,6 +116,21 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
      * won't affect another copy on the data plane when write action exists.
      */
     private static final int POP_VLAN_PUNT_GROUP_ID = 0xc0000000;
+
+    /**
+     * Executor for group checker thread that checks pop vlan punt group.
+     */
+    private ScheduledExecutorService groupChecker;
+
+    /**
+     * Queue for passing pop vlan punt group flow rules to the GroupChecker thread.
+     */
+    private Queue<FlowRule> flowRuleQueue;
+
+    /**
+     * Lock used in synchronizing driver thread with groupCheckerThread.
+     */
+    private ReentrantLock groupCheckerLock;
 
     @Override
     protected boolean requireVlanExtensions() {
@@ -155,6 +180,19 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
         groupHandler.init(deviceId, context);
     }
 
+    @Override
+    public void init(DeviceId deviceId, PipelinerContext context) {
+
+        if (supportPuntGroup()) {
+            // create a new executor at each init and a new empty queue
+            groupChecker = Executors.newSingleThreadScheduledExecutor(groupedThreads("onos/driver",
+                                                                                     "cpqd-ofdpa-%d", log));
+            flowRuleQueue = new ConcurrentLinkedQueue<>();
+            groupCheckerLock = new ReentrantLock();
+            groupChecker.scheduleAtFixedRate(new PopVlanPuntGroupChecker(), 20, 50, TimeUnit.MILLISECONDS);
+            super.init(deviceId, context);
+        }
+    }
     /*
      * Cpqd emulation does not require the non OF-standard rules for
      * matching untagged packets that ofdpa uses.
@@ -184,28 +222,43 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
         // ofdpa cannot match on ALL portnumber, so we need to use separate
         // rules for each port.
         List<PortNumber> portnums = new ArrayList<>();
-        if (portCriterion.port() == PortNumber.ALL) {
-            for (Port port : deviceService.getPorts(deviceId)) {
-                if (port.number().toLong() > 0 && port.number().toLong() < OFPP_MAX) {
-                    portnums.add(port.number());
+        if (portCriterion != null) {
+            if (portCriterion.port() == PortNumber.ALL) {
+                for (Port port : deviceService.getPorts(deviceId)) {
+                    if (port.number().toLong() > 0 && port.number().toLong() < OFPP_MAX) {
+                        portnums.add(port.number());
+                    }
                 }
+            } else {
+                portnums.add(portCriterion.port());
             }
-        } else {
-            portnums.add(portCriterion.port());
         }
 
         for (PortNumber pnum : portnums) {
             // NOTE: Emulating OFDPA behavior by popping off internal assigned
             //       VLAN before sending to controller
             if (supportPuntGroup() && vidCriterion.vlanId() == VlanId.NONE) {
-                GroupKey groupKey = popVlanPuntGroupKey();
-                Group group = groupService.getGroup(deviceId, groupKey);
-                if (group != null) {
-                    rules.add(buildPuntTableRule(pnum, assignedVlan));
-                } else {
-                    log.info("popVlanPuntGroup not found in dev:{}", deviceId);
-                    return Collections.emptyList();
+                try {
+                    groupCheckerLock.lock();
+                    if (flowRuleQueue == null) {
+                        // this means that the group has been created
+                        // and that groupChecker has destroyed the queue
+                        log.debug("Installing punt table rule for untagged port {} and vlan {}.",
+                                  pnum, assignedVlan);
+                        rules.add(buildPuntTableRule(pnum, assignedVlan));
+                    } else {
+                        // The VLAN punt group may be held back due to device initial audit.
+                        // In that case, we queue all punt table flow until the group has been created.
+                        log.debug("popVlanPuntGroup not found in dev:{}, queueing this flow rule.", deviceId);
+                        flowRuleQueue.add(buildPuntTableRule(pnum, assignedVlan));
+                    }
+                } finally {
+                    groupCheckerLock.unlock();
                 }
+            } else if (vidCriterion.vlanId() != VlanId.NONE) {
+                // for tagged ports just forward to the controller
+                log.debug("Installing punt rule for tagged port {} and vlan {}.", pnum, vidCriterion.vlanId());
+                rules.add(buildPuntTableRuleTagged(pnum, vidCriterion.vlanId()));
             }
 
             // create rest of flowrule
@@ -238,6 +291,30 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
                 .matchVlanId(assignedVlan);
         TrafficTreatment.Builder tbuilder = DefaultTrafficTreatment.builder()
                 .group(new GroupId(POP_VLAN_PUNT_GROUP_ID));
+
+        return DefaultFlowRule.builder()
+                .forDevice(deviceId)
+                .withSelector(sbuilder.build())
+                .withTreatment(tbuilder.build())
+                .withPriority(PacketPriority.CONTROL.priorityValue())
+                .fromApp(driverId)
+                .makePermanent()
+                .forTable(PUNT_TABLE).build();
+    }
+
+    /**
+     * Creates punt table entry that matches IN_PORT and VLAN_VID and forwards
+     * packet to controller tagged.
+     *
+     * @param portNumber port number
+     * @param packetVlan vlan tag of the packet
+     * @return punt table flow rule
+     */
+    private FlowRule buildPuntTableRuleTagged(PortNumber portNumber, VlanId packetVlan) {
+        TrafficSelector.Builder sbuilder = DefaultTrafficSelector.builder()
+                .matchInPort(portNumber)
+                .matchVlanId(packetVlan);
+        TrafficTreatment.Builder tbuilder = DefaultTrafficTreatment.builder().punt();
 
         return DefaultFlowRule.builder()
                 .forDevice(deviceId)
@@ -680,13 +757,6 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
     protected Collection<FlowRule> processVersatile(ForwardingObjective fwd) {
         log.info("Processing versatile forwarding objective");
 
-        EthTypeCriterion ethType =
-                (EthTypeCriterion) fwd.selector().getCriterion(Criterion.Type.ETH_TYPE);
-        if (ethType == null) {
-            log.error("Versatile forwarding objective must include ethType");
-            fail(fwd, ObjectiveError.BADPARAMS);
-            return Collections.emptySet();
-        }
         if (fwd.nextId() == null && fwd.treatment() == null) {
             log.error("Forwarding objective {} from {} must contain "
                     + "nextId or Treatment", fwd.selector(), fwd.appId());
@@ -724,6 +794,8 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
                         log.warn("Only allowed treatments in versatile forwarding "
                                 + "objectives are punts to the controller");
                     }
+                } else if (ins instanceof NoActionInstruction) {
+                    // No action is allowed and nothing needs to be done
                 } else {
                     log.warn("Cannot process instruction in versatile fwd {}", ins);
                 }
@@ -776,10 +848,9 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
         initTableMiss(MPLS_TABLE_1, ACL_TABLE, null);
         initTableMiss(BRIDGING_TABLE, ACL_TABLE, null);
         initTableMiss(ACL_TABLE, -1, null);
+        linkDiscoveryPuntTableRules();
 
         if (supportPuntGroup()) {
-            initTableMiss(PUNT_TABLE, -1,
-                    DefaultTrafficTreatment.builder().punt().build());
             initPopVlanPuntGroup();
         } else {
             initTableMiss(PUNT_TABLE, -1,
@@ -833,6 +904,51 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
     }
 
     /**
+     * Install lldp/bbdp matching rules at table PUNT_TABLE
+     * that forward traffic to controller.
+     *
+     */
+    private void linkDiscoveryPuntTableRules() {
+        FlowRuleOperations.Builder ops = FlowRuleOperations.builder();
+        TrafficTreatment treatment =  DefaultTrafficTreatment.builder().punt().build();
+
+        TrafficSelector.Builder lldpSelector = DefaultTrafficSelector.builder();
+        lldpSelector.matchEthType(EthType.EtherType.LLDP.ethType().toShort());
+        FlowRule lldpRule = DefaultFlowRule.builder()
+                .forDevice(deviceId)
+                .withSelector(lldpSelector.build())
+                .withTreatment(treatment)
+                .withPriority(HIGHEST_PRIORITY)
+                .fromApp(driverId)
+                .makePermanent()
+                .forTable(PUNT_TABLE).build();
+        ops =  ops.add(lldpRule);
+
+        TrafficSelector.Builder bbdpSelector = DefaultTrafficSelector.builder();
+        bbdpSelector.matchEthType(EthType.EtherType.BDDP.ethType().toShort());
+        FlowRule bbdpRule = DefaultFlowRule.builder()
+                .forDevice(deviceId)
+                .withSelector(bbdpSelector.build())
+                .withTreatment(treatment)
+                .withPriority(HIGHEST_PRIORITY)
+                .fromApp(driverId)
+                .makePermanent()
+                .forTable(PUNT_TABLE).build();
+        ops.add(bbdpRule);
+
+        flowRuleService.apply(ops.build(new FlowRuleOperationsContext() {
+            @Override
+            public void onSuccess(FlowRuleOperations ops) {
+                log.info("Added lldp/bbdp rules for table {} on {}", PUNT_TABLE, deviceId);
+            }
+            @Override
+            public void onError(FlowRuleOperations ops) {
+                log.warn("Failed to initialize lldp/bbdp rules for table {} on {}", PUNT_TABLE, deviceId);
+            }
+        }));
+    }
+
+    /**
      * Builds a indirect group contains pop_vlan and punt actions.
      * <p>
      * Using group instead of immediate action to ensure that
@@ -866,5 +982,48 @@ public class CpqdOfdpa2Pipeline extends Ofdpa2Pipeline {
     private GroupKey popVlanPuntGroupKey() {
         int hash = POP_VLAN_PUNT_GROUP_ID | (Objects.hash(deviceId) & FOUR_BIT_MASK);
         return new DefaultGroupKey(Ofdpa2Pipeline.appKryo.serialize(hash));
+    }
+
+    private class PopVlanPuntGroupChecker implements Runnable {
+        @Override
+        public void run() {
+            try {
+                groupCheckerLock.lock();
+                // this can happen outside of the lock but I think it is safer
+                // to include it here.
+                Group group = groupService.getGroup(deviceId, popVlanPuntGroupKey());
+                if (group != null) {
+                    log.debug("PopVlanPuntGroupChecker: Installing {} missing rules at punt table.",
+                              flowRuleQueue.size());
+
+                    // if we have pending flow rules install them
+                    if (flowRuleQueue.size() > 0) {
+                        FlowRuleOperations.Builder ops = FlowRuleOperations.builder();
+                        // we should not care about the context here, it can only be add
+                        // since when removing the rules the group should be there already.
+                        flowRuleQueue.forEach(ops::add);
+                        flowRuleService.apply(ops.build(new FlowRuleOperationsContext() {
+                            @Override
+                            public void onSuccess(FlowRuleOperations ops) {
+                                log.debug("Applied {} pop vlan punt rules in device {}",
+                                          ops.stages().get(0).size(), deviceId);
+                            }
+
+                            @Override
+                            public void onError(FlowRuleOperations ops) {
+                                log.error("Failed to apply all pop vlan punt rules in dev {}", deviceId);
+                            }
+                        }));
+                    }
+                    // this signifies that the group is created and now
+                    // flow rules can be installed directly
+                    flowRuleQueue = null;
+                    // shutdown the group checker gracefully
+                    groupChecker.shutdown();
+                }
+            } finally {
+                groupCheckerLock.unlock();
+            }
+        }
     }
 }

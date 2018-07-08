@@ -16,11 +16,14 @@
 
 package org.onosproject.store.primitives.resources.impl;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Multiset;
@@ -30,6 +33,7 @@ import io.atomix.protocols.raft.service.RaftService;
 import org.apache.commons.collections.keyvalue.DefaultMapEntry;
 import org.junit.Test;
 import org.onlab.util.Tools;
+import org.onosproject.store.service.AsyncIterator;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -163,7 +167,7 @@ public class AtomixConsistentSetMultimapTest extends AtomixTestBase<AtomixConsis
 
         //Check that contains key works properly for removed keys
         map.containsKey(removedKey[0])
-                .thenAccept(result -> assertFalse(result));
+                .thenAccept(result -> assertFalse(result)).join();
 
         //Check that contains value works correctly for removed values
         allValues.forEach(value -> {
@@ -232,6 +236,28 @@ public class AtomixConsistentSetMultimapTest extends AtomixTestBase<AtomixConsis
                     .thenAccept(result -> assertTrue(result)).join();
             map.removeAll(key, Lists.newArrayList(allValues.subList(2, 4)))
                     .thenAccept(result -> assertFalse(result)).join();
+        });
+
+        allKeys.forEach(key -> {
+            map.putAndGet(key, valueOne)
+                .thenAccept(result -> assertEquals(1, result.value().size()));
+            map.putAndGet(key, valueTwo)
+                .thenAccept(result -> assertEquals(2, result.value().size()));
+            map.putAndGet(key, valueThree)
+                .thenAccept(result -> assertEquals(3, result.value().size()));
+            map.putAndGet(key, valueFour)
+                .thenAccept(result -> assertEquals(4, result.value().size()));
+        });
+
+        allKeys.forEach(key -> {
+            map.removeAndGet(key, valueOne)
+                .thenAccept(result -> assertEquals(3, result.value().size()));
+            map.removeAndGet(key, valueTwo)
+                .thenAccept(result -> assertEquals(2, result.value().size()));
+            map.removeAndGet(key, valueThree)
+                .thenAccept(result -> assertEquals(1, result.value().size()));
+            map.removeAndGet(key, valueFour)
+                .thenAccept(result -> assertEquals(0, result.value().size()));
         });
 
         map.isEmpty().thenAccept(result -> assertTrue(result)).join();
@@ -305,6 +331,24 @@ public class AtomixConsistentSetMultimapTest extends AtomixTestBase<AtomixConsis
         });
 
         map.destroy().join();
+    }
+
+    @Test
+    public void testStreams() throws Exception {
+        AtomixConsistentSetMultimap map = createResource("testStreams");
+        for (int i = 0; i < 100; i++) {
+            for (int j = 0; j < 100; j++) {
+                map.put(String.valueOf(i), String.valueOf(j).getBytes()).join();
+            }
+        }
+
+        List<Map.Entry<String, byte[]>> entries = new ArrayList<>();
+        AsyncIterator<Map.Entry<String, byte[]>> iterator = map.iterator().get(5, TimeUnit.SECONDS);
+        while (iterator.hasNext().get(5, TimeUnit.SECONDS)) {
+            map.put(keyOne, UUID.randomUUID().toString().getBytes()).join();
+            entries.add(iterator.next().get(5, TimeUnit.SECONDS));
+        }
+        assertEquals(10000, entries.size());
     }
 
     /**
@@ -402,7 +446,7 @@ public class AtomixConsistentSetMultimapTest extends AtomixTestBase<AtomixConsis
             AtomixConsistentSetMultimap map = newPrimitive(mapName);
             return map;
         } catch (Throwable e) {
-            throw new RuntimeException(e.toString());
+            throw new IllegalStateException(e.toString());
         }
     }
 

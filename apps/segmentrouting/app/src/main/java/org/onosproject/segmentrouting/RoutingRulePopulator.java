@@ -34,7 +34,6 @@ import org.onosproject.net.flowobjective.ObjectiveContext;
 import org.onosproject.net.flowobjective.ObjectiveError;
 import org.onosproject.net.intf.Interface;
 import org.onosproject.net.packet.PacketPriority;
-import org.onosproject.segmentrouting.DefaultRoutingHandler.PortFilterInfo;
 import org.onosproject.segmentrouting.config.DeviceConfigNotFoundException;
 import org.onosproject.segmentrouting.config.DeviceConfiguration;
 import org.onosproject.segmentrouting.grouphandler.DefaultGroupHandler;
@@ -79,6 +78,8 @@ import static org.onlab.packet.ICMP6.ROUTER_SOLICITATION;
 import static org.onlab.packet.IPv6.PROTOCOL_ICMP6;
 import static org.onosproject.segmentrouting.SegmentRoutingManager.INTERNAL_VLAN;
 import static org.onosproject.segmentrouting.SegmentRoutingService.DEFAULT_PRIORITY;
+
+import static org.onosproject.segmentrouting.SegmentRoutingManager.PSEUDOWIRE_VLAN;
 
 /**
  * Populator of segment routing flow rules.
@@ -539,6 +540,7 @@ public class RoutingRulePopulator {
         TrafficTreatment.Builder tbuilder = DefaultTrafficTreatment.builder();
         DestinationSet ds;
         TrafficTreatment treatment;
+        DestinationSet.DestinationSetType dsType;
 
         if (destSw2 == null) {
             // single dst - create destination set based on next-hop
@@ -547,18 +549,17 @@ public class RoutingRulePopulator {
             Set<DeviceId> nhd1 = nextHops.get(destSw1);
             if (nhd1.size() == 1 && nhd1.iterator().next().equals(destSw1)) {
                 tbuilder.immediate().decNwTtl();
-                ds = new DestinationSet(false, false, destSw1);
+                ds = DestinationSet.createTypePushNone(destSw1);
                 treatment = tbuilder.build();
             } else {
-                ds = new DestinationSet(false, false, segmentId1, destSw1);
+                ds = DestinationSet.createTypePushBos(segmentId1, destSw1);
                 treatment = null;
             }
         } else {
             // dst pair - IP rules for dst-pairs are always from other edge nodes
             // the destination set needs to have both destinations, even if there
             // are no next hops to one of them
-            ds = new DestinationSet(false, false, segmentId1, destSw1,
-                                    segmentId2, destSw2);
+            ds = DestinationSet.createTypePushBos(segmentId1, destSw1, segmentId2, destSw2);
             treatment = null;
         }
 
@@ -827,6 +828,7 @@ public class RoutingRulePopulator {
 
         TrafficTreatment.Builder tbuilder = DefaultTrafficTreatment.builder();
         DestinationSet ds = null;
+        DestinationSet.DestinationSetType dstType = null;
         boolean simple = false;
         if (phpRequired) {
             // php case - pop should always be flow-action
@@ -841,17 +843,15 @@ public class RoutingRulePopulator {
                 tbuilder.decNwTtl();
                 // standard case -> BoS == True; pop results in IP packet and forwarding
                 // is via an ECMP group
-                ds = new DestinationSet(false, false, destSw);
+                ds = DestinationSet.createTypePopBos(destSw);
             } else {
                 tbuilder.deferred().popMpls(EthType.EtherType.MPLS_UNICAST.ethType())
                     .decMplsTtl();
                 // double-label case -> BoS == False, pop results in MPLS packet
                 // depending on configuration we can ECMP this packet or choose one output
-                if (srManager.getMplsEcmp()) {
-                    ds = new DestinationSet(true, false, destSw);
-                } else {
-                    ds = new DestinationSet(true, false, destSw);
-                    simple = true;
+                ds = DestinationSet.createTypePopNotBos(destSw);
+                if (!srManager.getMplsEcmp()) {
+                   simple = true;
                 }
             }
         } else {
@@ -860,11 +860,10 @@ public class RoutingRulePopulator {
             tbuilder.deferred().decMplsTtl();
             // swap results in MPLS packet with same BoS bit regardless of bit value
             // depending on configuration we can ECMP this packet or choose one output
-            // XXX reconsider types
-            if (srManager.getMplsEcmp()) {
-                ds = new DestinationSet(false, true, segmentId, destSw);
-            } else {
-                ds = new DestinationSet(false, true, segmentId, destSw);
+            // differentiate here between swap with not bos or swap with bos
+            ds = isBos ? DestinationSet.createTypeSwapBos(segmentId, destSw) :
+                    DestinationSet.createTypeSwapNotBos(segmentId, destSw);
+            if (!srManager.getMplsEcmp()) {
                 simple = true;
             }
         }
@@ -933,8 +932,7 @@ public class RoutingRulePopulator {
         }
         log.debug("Filtering on dev:{}, disabledPorts:{}, errorPorts:{}, filteredPorts:{}",
                   deviceId, disabledPorts, errorPorts, filteredPorts);
-        return srManager.defaultRoutingHandler.new PortFilterInfo(disabledPorts,
-                                                       errorPorts, filteredPorts);
+        return new PortFilterInfo(disabledPorts, errorPorts, filteredPorts);
     }
 
     /**
@@ -975,6 +973,10 @@ public class RoutingRulePopulator {
             if (!processSinglePortFiltersInternal(deviceId, portnum, true, INTERNAL_VLAN, install)) {
                 return false;
             }
+            // Filter for receiveing pseudowire traffic
+            if (!processSinglePortFiltersInternal(deviceId, portnum, false, PSEUDOWIRE_VLAN, install)) {
+                return false;
+            }
         }
         return true;
     }
@@ -998,7 +1000,23 @@ public class RoutingRulePopulator {
 
     private boolean processSinglePortFiltersInternal(DeviceId deviceId, PortNumber portnum,
                                                       boolean pushVlan, VlanId vlanId, boolean install) {
-        FilteringObjective.Builder fob = buildFilteringObjective(deviceId, portnum, pushVlan, vlanId);
+        boolean doTMAC = true;
+
+        if (!pushVlan) {
+            // Skip the tagged vlans belonging to an interface without an IP address
+            Set<Interface> ifaces = srManager.interfaceService
+                    .getInterfacesByPort(new ConnectPoint(deviceId, portnum))
+                    .stream()
+                    .filter(intf -> intf.vlanTagged().contains(vlanId) && intf.ipAddressesList().isEmpty())
+                    .collect(Collectors.toSet());
+            if (!ifaces.isEmpty()) {
+                log.debug("processSinglePortFiltersInternal: skipping TMAC for vlan {} at {}/{} - no IP",
+                          vlanId, deviceId, portnum);
+                doTMAC = false;
+            }
+        }
+
+        FilteringObjective.Builder fob = buildFilteringObjective(deviceId, portnum, pushVlan, vlanId, doTMAC);
         if (fob == null) {
             // error encountered during build
             return false;
@@ -1019,7 +1037,7 @@ public class RoutingRulePopulator {
     }
 
     private FilteringObjective.Builder buildFilteringObjective(DeviceId deviceId, PortNumber portnum,
-                                                               boolean pushVlan, VlanId vlanId) {
+                                                               boolean pushVlan, VlanId vlanId, boolean doTMAC) {
         MacAddress deviceMac;
         try {
             deviceMac = config.getDeviceMac(deviceId);
@@ -1028,9 +1046,15 @@ public class RoutingRulePopulator {
             return null;
         }
         FilteringObjective.Builder fob = DefaultFilteringObjective.builder();
-        fob.withKey(Criteria.matchInPort(portnum))
-            .addCondition(Criteria.matchEthDst(deviceMac))
-            .withPriority(SegmentRoutingService.DEFAULT_PRIORITY);
+
+        if (doTMAC) {
+            fob.withKey(Criteria.matchInPort(portnum))
+                    .addCondition(Criteria.matchEthDst(deviceMac))
+                    .withPriority(SegmentRoutingService.DEFAULT_PRIORITY);
+        } else {
+            fob.withKey(Criteria.matchInPort(portnum))
+                    .withPriority(SegmentRoutingService.DEFAULT_PRIORITY);
+        }
 
         TrafficTreatment.Builder tBuilder = DefaultTrafficTreatment.builder();
 
@@ -1371,6 +1395,75 @@ public class RoutingRulePopulator {
         TrafficTreatment.Builder tBuilder = DefaultTrafficTreatment.builder();
         tBuilder.wipeDeferred();
         return fwdObjBuilder(sBuilder.build(), tBuilder.build(), priority);
+    }
+
+    /**
+     * Populates a forwarding objective to send packets that miss other high
+     * priority Bridging Table entries to a group that contains all ports of
+     * its subnet.
+     *
+     * @param address the address to block
+     * @param deviceId switch ID to set the rules
+     */
+    void populateDefaultRouteBlackhole(DeviceId deviceId, IpPrefix address) {
+        updateDefaultRouteBlackhole(deviceId, address, true);
+    }
+
+    /**
+     * Populates a forwarding objective to send packets that miss other high
+     * priority Bridging Table entries to a group that contains all ports of
+     * its subnet.
+     *
+     * @param address the address to block
+     * @param deviceId switch ID to set the rules
+     */
+    void removeDefaultRouteBlackhole(DeviceId deviceId, IpPrefix address) {
+        updateDefaultRouteBlackhole(deviceId, address, false);
+    }
+
+    private void updateDefaultRouteBlackhole(DeviceId deviceId, IpPrefix address, boolean install) {
+        try {
+            if (srManager.deviceConfiguration.isEdgeDevice(deviceId)) {
+
+                TrafficSelector.Builder sbuilder = DefaultTrafficSelector.builder();
+                if (address.isIp4()) {
+                    sbuilder.matchIPDst(address);
+                    sbuilder.matchEthType(EthType.EtherType.IPV4.ethType().toShort());
+                } else {
+                    sbuilder.matchIPv6Dst(address);
+                    sbuilder.matchEthType(EthType.EtherType.IPV6.ethType().toShort());
+                }
+
+                TrafficTreatment.Builder tBuilder = DefaultTrafficTreatment.builder();
+
+                tBuilder.transition(60);
+                tBuilder.wipeDeferred();
+
+                ForwardingObjective.Builder fob = DefaultForwardingObjective.builder();
+                fob.withFlag(Flag.SPECIFIC)
+                        .withSelector(sbuilder.build())
+                        .withTreatment(tBuilder.build())
+                        .withPriority(getPriorityFromPrefix(address))
+                        .fromApp(srManager.appId)
+                        .makePermanent();
+
+                log.debug("{} blackhole forwarding objectives for dev: {}",
+                        install ? "Installing" : "Removing", deviceId);
+                ObjectiveContext context = new DefaultObjectiveContext(
+                        (objective) -> log.debug("Forward for {} {}", deviceId,
+                                install ? "installed" : "removed"),
+                        (objective, error) -> log.warn("Failed to {} forward for {}: {}",
+                                install ? "install" : "remove", deviceId, error));
+                if (install) {
+                    srManager.flowObjectiveService.forward(deviceId, fob.add(context));
+                } else {
+                    srManager.flowObjectiveService.forward(deviceId, fob.remove(context));
+                }
+            }
+        } catch (DeviceConfigNotFoundException e) {
+            log.info("Not populating blackhole for un-configured device {}", deviceId);
+        }
+
     }
 
     /**

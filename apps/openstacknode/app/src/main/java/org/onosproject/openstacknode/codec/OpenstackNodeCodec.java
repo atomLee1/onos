@@ -26,7 +26,7 @@ import org.onosproject.openstacknode.api.NodeState;
 import org.onosproject.openstacknode.api.OpenstackAuth;
 import org.onosproject.openstacknode.api.OpenstackNode;
 import org.onosproject.openstacknode.api.OpenstackPhyInterface;
-import org.onosproject.openstacknode.impl.DefaultOpenstackNode;
+import org.onosproject.openstacknode.api.DefaultOpenstackNode;
 import org.slf4j.Logger;
 
 import java.util.ArrayList;
@@ -56,6 +56,7 @@ public final class OpenstackNodeCodec extends JsonCodec<OpenstackNode> {
     private static final String STATE = "state";
     private static final String PHYSICAL_INTERFACES = "phyIntfs";
     private static final String AUTHENTICATION = "authentication";
+    private static final String END_POINT = "endPoint";
 
     private static final String MISSING_MESSAGE = " is required in OpenstackNode";
 
@@ -66,8 +67,8 @@ public final class OpenstackNodeCodec extends JsonCodec<OpenstackNode> {
         ObjectNode result = context.mapper().createObjectNode()
                 .put(HOST_NAME, node.hostname())
                 .put(TYPE, node.type().name())
-                .put(MANAGEMENT_IP, node.managementIp().toString())
-                .put(STATE, node.state().name());
+                .put(STATE, node.state().name())
+                .put(MANAGEMENT_IP, node.managementIp().toString());
 
         OpenstackNode.NodeType type = node.type();
 
@@ -77,6 +78,8 @@ public final class OpenstackNodeCodec extends JsonCodec<OpenstackNode> {
 
         if (type != OpenstackNode.NodeType.CONTROLLER) {
             result.put(INTEGRATION_BRIDGE, node.intgBridge().toString());
+        } else {
+            result.put(END_POINT, node.endPoint());
         }
 
         if (node.vlanIntf() != null) {
@@ -122,8 +125,8 @@ public final class OpenstackNodeCodec extends JsonCodec<OpenstackNode> {
         DefaultOpenstackNode.Builder nodeBuilder = DefaultOpenstackNode.builder()
                 .hostname(hostname)
                 .type(OpenstackNode.NodeType.valueOf(type))
-                .managementIp(IpAddress.valueOf(mIp))
-                .state(NodeState.INIT);
+                .state(NodeState.INIT)
+                .managementIp(IpAddress.valueOf(mIp));
 
         if (type.equals(GATEWAY)) {
             nodeBuilder.uplinkPort(nullIsIllegal(json.get(UPLINK_PORT).asText(),
@@ -133,6 +136,10 @@ public final class OpenstackNodeCodec extends JsonCodec<OpenstackNode> {
             String iBridge = nullIsIllegal(json.get(INTEGRATION_BRIDGE).asText(),
                     INTEGRATION_BRIDGE + MISSING_MESSAGE);
             nodeBuilder.intgBridge(DeviceId.deviceId(iBridge));
+        } else {
+            String endPoint = nullIsIllegal(json.get(END_POINT).asText(),
+                    END_POINT + MISSING_MESSAGE);
+            nodeBuilder.endPoint(endPoint);
         }
         if (json.get(VLAN_INTF_NAME) != null) {
             nodeBuilder.vlanIntf(json.get(VLAN_INTF_NAME).asText());

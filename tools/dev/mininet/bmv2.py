@@ -1,26 +1,22 @@
-import os
-import socket
-import re
 import json
+import multiprocessing
+import os
+import random
+import re
+import socket
 import threading
-import urllib2
-
 import time
+import urllib2
 from contextlib import closing
-
-from mininet.log import info, warn, error
+from mininet.log import info, warn
 from mininet.node import Switch, Host
 
-if 'ONOS_ROOT' not in os.environ:
-    error("ERROR: environment var $ONOS_ROOT not set")
-    exit()
-
 SIMPLE_SWITCH_GRPC = 'simple_switch_grpc'
-ONOS_ROOT = os.environ["ONOS_ROOT"]
 PKT_BYTES_TO_DUMP = 80
 VALGRIND_PREFIX = 'valgrind --leak-check=yes'
 SWITCH_START_TIMEOUT = 5  # seconds
 BMV2_LOG_LINES = 5
+BMV2_DEFAULT_DEVICE_ID = 0
 
 
 def parseBoolean(value):
@@ -45,14 +41,16 @@ def writeToFile(path, value):
 
 def watchDog(sw):
     while True:
+        if ONOSBmv2Switch.mininet_exception == 1:
+            sw.killBmv2(log=False)
+            return
         if sw.stopped:
             return
         with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
             if s.connect_ex(('127.0.0.1', sw.grpcPort)) == 0:
                 time.sleep(1)
             else:
-                warn("\n*** WARN: BMv2 instance %s (%s) died!\n"
-                     % (sw.deviceId, sw.name))
+                warn("\n*** WARN: BMv2 instance %s died!\n" % sw.name)
                 sw.printBmv2Log()
                 print ("-" * 80) + "\n"
                 return
@@ -77,22 +75,20 @@ class ONOSHost(Host):
 
 class ONOSBmv2Switch(Switch):
     """BMv2 software switch with gRPC server"""
-
-    deviceId = 0
+    # Shared value used to notify to all instances of this class that a Mininet
+    # exception occurred. Mininet exception handling doesn't call the stop()
+    # method, so the mn process would hang after clean-up since Bmv2 would still
+    # be running.
+    mininet_exception = multiprocessing.Value('i', 0)
 
     def __init__(self, name, json=None, debugger=False, loglevel="warn",
                  elogger=False, grpcport=None, cpuport=255,
                  thriftport=None, netcfg=True, dryrun=False, pipeconf="",
                  pktdump=False, valgrind=False, gnmi=False,
-                 portcfg=True, **kwargs):
+                 portcfg=True, onosdevid=None, **kwargs):
         Switch.__init__(self, name, **kwargs)
-        self.grpcPort = pickUnusedPort() if not grpcport else grpcport
-        self.thriftPort = pickUnusedPort() if not thriftport else thriftport
-        if self.dpid:
-            self.deviceId = int(self.dpid, 0 if 'x' in self.dpid else 16)
-        else:
-            self.deviceId = ONOSBmv2Switch.deviceId
-            ONOSBmv2Switch.deviceId += 1
+        self.grpcPort = grpcport
+        self.thriftPort = thriftport
         self.cpuPort = cpuport
         self.json = json
         self.debugger = parseBoolean(debugger)
@@ -100,28 +96,28 @@ class ONOSBmv2Switch(Switch):
         # Important: Mininet removes all /tmp/*.log files in case of exceptions.
         # We want to be able to see the bmv2 log if anything goes wrong, hence
         # avoid the .log extension.
-        self.logfile = '/tmp/bmv2-%d-log' % self.deviceId
+        self.logfile = '/tmp/bmv2-%s-log' % self.name
         self.elogger = parseBoolean(elogger)
         self.pktdump = parseBoolean(pktdump)
         self.netcfg = parseBoolean(netcfg)
         self.dryrun = parseBoolean(dryrun)
         self.valgrind = parseBoolean(valgrind)
-        self.netcfgfile = '/tmp/bmv2-%d-netcfg.json' % self.deviceId
+        self.netcfgfile = '/tmp/bmv2-%s-netcfg.json' % self.name
         self.pipeconfId = pipeconf
         self.injectPorts = parseBoolean(portcfg)
         self.withGnmi = parseBoolean(gnmi)
         self.longitude = kwargs['longitude'] if 'longitude' in kwargs else None
         self.latitude = kwargs['latitude'] if 'latitude' in kwargs else None
-        self.onosDeviceId = "device:bmv2:%d" % self.deviceId
+        if onosdevid is not None and len(onosdevid) > 0:
+            self.onosDeviceId = onosdevid
+        else:
+            self.onosDeviceId = "device:bmv2:%s" % self.name
         self.logfd = None
         self.bmv2popen = None
         self.stopped = False
 
         # Remove files from previous executions
         self.cleanupTmpFiles()
-
-        writeToFile("/tmp/bmv2-%d-grpc-port" % self.deviceId, self.grpcPort)
-        writeToFile("/tmp/bmv2-%d-thrift-port" % self.deviceId, self.thriftPort)
 
     def getSourceIp(self, dstIP):
         """
@@ -147,8 +143,12 @@ class ONOSBmv2Switch(Switch):
                 "p4runtime": {
                     "ip": srcIP,
                     "port": self.grpcPort,
-                    "deviceId": self.deviceId,
+                    "deviceId": BMV2_DEFAULT_DEVICE_ID,
                     "deviceKeyId": "p4runtime:%s" % self.onosDeviceId
+                },
+                "bmv2-thrift": {
+                    "ip": srcIP,
+                    "port": self.thriftPort
                 }
             },
             "piPipeconf": {
@@ -235,6 +235,9 @@ class ONOSBmv2Switch(Switch):
 
         info("\nStarting BMv2 target: %s\n" % cmdString)
 
+        writeToFile("/tmp/bmv2-%s-grpc-port" % self.name, self.grpcPort)
+        writeToFile("/tmp/bmv2-%s-thrift-port" % self.name, self.thriftPort)
+
         try:
             if not self.dryrun:
                 # Start the switch
@@ -247,26 +250,34 @@ class ONOSBmv2Switch(Switch):
                 threading.Thread(target=watchDog, args=[self]).start()
 
             self.doOnosNetcfg(self.controllerIp(controllers))
-        except Exception as ex:
+        except Exception:
+            ONOSBmv2Switch.mininet_exception = 1
             self.killBmv2()
             self.printBmv2Log()
-            raise ex
+            raise
 
     def grpcTargetArgs(self):
-        args = ['--device-id %s' % str(self.deviceId)]
+        if self.grpcPort is None:
+            self.grpcPort = pickUnusedPort()
+        if self.thriftPort is None:
+            self.thriftPort = pickUnusedPort()
+        args = ['--device-id %s' % str(BMV2_DEFAULT_DEVICE_ID)]
         for port, intf in self.intfs.items():
             if not intf.IP():
                 args.append('-i %d@%s' % (port, intf.name))
+        args.append('--thrift-port %s' % self.thriftPort)
+        ntfaddr = 'ipc:///tmp/bmv2-%s-notifications.ipc' % self.name
+        args.append('--notifications-addr %s' % ntfaddr)
         if self.elogger:
-            nanomsg = 'ipc:///tmp/bmv2-%d-log.ipc' % self.deviceId
-            args.append('--nanolog %s' % nanomsg)
+            nanologaddr = 'ipc:///tmp/bmv2-%s-nanolog.ipc' % self.name
+            args.append('--nanolog %s' % nanologaddr)
         if self.debugger:
-            args.append('--debugger')
+            dbgaddr = 'ipc:///tmp/bmv2-%s-debug.ipc' % self.name
+            args.append('--debugger-addr %s' % dbgaddr)
         args.append('--log-console')
         if self.pktdump:
             args.append('--pcap --dump-packet-data %s' % PKT_BYTES_TO_DUMP)
         args.append('-L%s' % self.loglevel)
-        args.append('--thrift-port %s' % self.thriftPort)
         if not self.json:
             args.append('--no-p4')
         else:
@@ -290,7 +301,7 @@ class ONOSBmv2Switch(Switch):
                 break
             # Port is not open yet. If there is time, we wait a bit.
             if endtime > time.time():
-                time.sleep(0.2)
+                time.sleep(0.1)
             else:
                 # Time's up.
                 raise Exception("Switch did not start before timeout")
@@ -298,7 +309,7 @@ class ONOSBmv2Switch(Switch):
     def printBmv2Log(self):
         if os.path.isfile(self.logfile):
             print "-" * 80
-            print "BMv2 %d log (from %s):" % (self.deviceId, self.logfile)
+            print "%s log (from %s):" % (self.name, self.logfile)
             with open(self.logfile, 'r') as f:
                 lines = f.readlines()
                 if len(lines) > BMV2_LOG_LINES:
@@ -314,7 +325,7 @@ class ONOSBmv2Switch(Switch):
         except AttributeError:
             clist = controllers
         assert len(clist) > 0
-        return clist[0].IP()
+        return random.choice(clist).IP()
 
     def killBmv2(self, log=False):
         if self.bmv2popen is not None:
@@ -325,7 +336,7 @@ class ONOSBmv2Switch(Switch):
             self.logfd.close()
 
     def cleanupTmpFiles(self):
-        self.cmd("rm -f /tmp/bmv2-%d-*" % self.deviceId)
+        self.cmd("rm -f /tmp/bmv2-%s-*" % self.name)
 
     def stop(self, deleteIntfs=True):
         """Terminate switch."""

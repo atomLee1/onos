@@ -71,6 +71,7 @@ import static org.onosproject.net.pi.impl.PiUtils.translateTableId;
 final class PiFlowRuleTranslatorImpl {
 
     public static final int MAX_PI_PRIORITY = (int) Math.pow(2, 24);
+    public static final int MIN_PI_PRIORITY = 1;
     private static final Logger log = LoggerFactory.getLogger(PiFlowRuleTranslatorImpl.class);
 
     private PiFlowRuleTranslatorImpl() {
@@ -110,9 +111,9 @@ final class PiFlowRuleTranslatorImpl {
                     .build();
             // FIXME: P4Runtime limit
             // Need to ignore priority if no TCAM lookup match field
-            needPriority = fieldMatches.stream()
-                    .anyMatch(match -> match.type() == PiMatchType.TERNARY ||
-                            match.type() == PiMatchType.RANGE);
+            needPriority = tableModel.matchFields().stream()
+                    .anyMatch(match -> match.matchType() == PiMatchType.TERNARY ||
+                            match.matchType() == PiMatchType.RANGE);
         }
         // Translate treatment.
         final PiTableAction piTableAction = translateTreatment(rule.treatment(), interpreter, piTableId, pipelineModel);
@@ -129,15 +130,14 @@ final class PiFlowRuleTranslatorImpl {
         }
 
         if (needPriority) {
-            // In the P4 world 0 is the highest priority, in ONOS the lowest one.
-            // FIXME: move priority conversion to the P4Runtime driver
+            // FIXME: move priority check to P4Runtime driver.
             final int newPriority;
             if (rule.priority() > MAX_PI_PRIORITY) {
                 log.warn("Flow rule priority too big, setting translated priority to max value {}: {}",
                          MAX_PI_PRIORITY, rule);
-                newPriority = 0;
+                newPriority = MAX_PI_PRIORITY;
             } else {
-                newPriority = MAX_PI_PRIORITY - rule.priority();
+                newPriority = MIN_PI_PRIORITY + rule.priority();
             }
             tableEntryBuilder.withPriority(newPriority);
         }
@@ -146,7 +146,7 @@ final class PiFlowRuleTranslatorImpl {
             if (tableModel.supportsAging()) {
                 tableEntryBuilder.withTimeout((double) rule.timeout());
             } else {
-                log.warn("Flow rule is temporary, but table '{}' doesn't support " +
+                log.debug("Flow rule is temporary, but table '{}' doesn't support " +
                                  "aging, translating to permanent.", tableModel.id());
             }
 
@@ -441,8 +441,6 @@ final class PiFlowRuleTranslatorImpl {
                     return new PiRangeFieldMatch(fieldMatch.fieldId(),
                                                  ((PiRangeFieldMatch) fieldMatch).lowValue().fit(modelBitWidth),
                                                  ((PiRangeFieldMatch) fieldMatch).highValue().fit(modelBitWidth));
-                case VALID:
-                    return fieldMatch;
                 default:
                     // Should never be here.
                     throw new IllegalArgumentException(

@@ -56,13 +56,19 @@ import java.util.concurrent.ExecutorService;
 import static java.util.concurrent.Executors.newSingleThreadExecutor;
 import static org.onlab.util.Tools.groupedThreads;
 import static org.onosproject.openstacknetworking.api.Constants.ACL_TABLE;
+import static org.onosproject.openstacknetworking.api.Constants.DHCP_ARP_TABLE;
+import static org.onosproject.openstacknetworking.api.Constants.FLAT_TABLE;
 import static org.onosproject.openstacknetworking.api.Constants.FORWARDING_TABLE;
 import static org.onosproject.openstacknetworking.api.Constants.OPENSTACK_NETWORKING_APP_ID;
 import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_ADMIN_RULE;
-import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_FLAT_RULE;
+import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_FLAT_DOWNSTREAM_RULE;
+import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_FLAT_JUMP_DOWNSTREAM_RULE;
+import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_FLAT_JUMP_UPSTREAM_RULE;
+import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_FLAT_UPSTREAM_RULE;
 import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_SWITCHING_RULE;
 import static org.onosproject.openstacknetworking.api.Constants.PRIORITY_TUNNEL_TAG_RULE;
-import static org.onosproject.openstacknetworking.api.Constants.SRC_VNI_TABLE;
+import static org.onosproject.openstacknetworking.api.Constants.STAT_FLAT_OUTBOUND_TABLE;
+import static org.onosproject.openstacknetworking.api.Constants.VTAG_TABLE;
 import static org.onosproject.openstacknetworking.util.RulePopulatorUtil.buildExtension;
 import static org.onosproject.openstacknode.api.OpenstackNode.NodeType.COMPUTE;
 import static org.slf4j.LoggerFactory.getLogger;
@@ -139,15 +145,16 @@ public final class OpenstackSwitchingHandler {
         switch (type) {
             case VXLAN:
                 setTunnelTagFlowRules(instPort, install);
-                setForwardingRules(instPort, install);
+                setForwardingRulesForVxlan(instPort, install);
                 break;
             case VLAN:
                 setVlanTagFlowRules(instPort, install);
                 setForwardingRulesForVlan(instPort, install);
                 break;
             case FLAT:
-                setDownstreamRules(instPort, install);
-                setUpstreamRules(instPort, install);
+                setFlatJumpRules(instPort, install);
+                setDownstreamRulesForFlat(instPort, install);
+                setUpstreamRulesForFlat(instPort, install);
                 break;
             default:
                 log.warn("Unsupported network tunnel type {}", type.name());
@@ -155,7 +162,92 @@ public final class OpenstackSwitchingHandler {
         }
     }
 
-    private void setDownstreamRules(InstancePort instPort, boolean install) {
+    /**
+     * Removes virtual port.
+     *
+     * @param instPort instance port
+     */
+    private void removeVportRules(InstancePort instPort) {
+        NetworkType type = osNetworkService.network(instPort.networkId()).getNetworkType();
+
+        switch (type) {
+            case VXLAN:
+                setTunnelTagFlowRules(instPort, false);
+                break;
+            case VLAN:
+                setVlanTagFlowRules(instPort, false);
+                break;
+            case FLAT:
+                setFlatJumpRules(instPort, false);
+                setUpstreamRulesForFlat(instPort, false);
+                setDownstreamRulesForFlat(instPort, false);
+                break;
+            default:
+                log.warn("Unsupported network type {}", type.name());
+                break;
+        }
+    }
+
+    private void setFlatJumpRules(InstancePort port, boolean install) {
+        TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
+        selector.matchInPort(port.portNumber());
+
+        TrafficTreatment.Builder treatment = DefaultTrafficTreatment.builder();
+        treatment.transition(STAT_FLAT_OUTBOUND_TABLE);
+
+        osFlowRuleService.setRule(
+                appId,
+                port.deviceId(),
+                selector.build(),
+                treatment.build(),
+                PRIORITY_FLAT_JUMP_UPSTREAM_RULE,
+                DHCP_ARP_TABLE,
+                install);
+
+        Network network = osNetworkService.network(port.networkId());
+
+        if (network == null) {
+            log.warn("The network does not exist");
+            return;
+        }
+        PortNumber portNumber = osNodeService.node(port.deviceId())
+                .phyIntfPortNum(network.getProviderPhyNet());
+
+        if (portNumber == null) {
+            log.warn("The port number does not exist");
+            return;
+        }
+
+        selector = DefaultTrafficSelector.builder();
+        selector.matchInPort(portNumber)
+                .matchEthType(Ethernet.TYPE_IPV4)
+                .matchIPDst(port.ipAddress().toIpPrefix());
+
+        osFlowRuleService.setRule(
+                appId,
+                port.deviceId(),
+                selector.build(),
+                treatment.build(),
+                PRIORITY_FLAT_JUMP_DOWNSTREAM_RULE,
+                DHCP_ARP_TABLE,
+                install);
+
+        selector = DefaultTrafficSelector.builder();
+        selector.matchInPort(portNumber)
+                .matchEthType(Ethernet.TYPE_ARP)
+                .matchArpTpa(port.ipAddress().getIp4Address());
+
+        osFlowRuleService.setRule(
+                appId,
+                port.deviceId(),
+                selector.build(),
+                treatment.build(),
+                PRIORITY_FLAT_JUMP_DOWNSTREAM_RULE,
+                DHCP_ARP_TABLE,
+                install);
+    }
+
+    private void setDownstreamRulesForFlat(InstancePort instPort, boolean install) {
         TrafficSelector selector = DefaultTrafficSelector.builder()
                 .matchEthType(Ethernet.TYPE_IPV4)
                 .matchIPDst(instPort.ipAddress().toIpPrefix())
@@ -169,8 +261,8 @@ public final class OpenstackSwitchingHandler {
                 instPort.deviceId(),
                 selector,
                 treatment,
-                PRIORITY_FLAT_RULE,
-                SRC_VNI_TABLE,
+                PRIORITY_FLAT_DOWNSTREAM_RULE,
+                FLAT_TABLE,
                 install);
 
         selector = DefaultTrafficSelector.builder()
@@ -183,12 +275,12 @@ public final class OpenstackSwitchingHandler {
                 instPort.deviceId(),
                 selector,
                 treatment,
-                PRIORITY_FLAT_RULE,
-                SRC_VNI_TABLE,
+                PRIORITY_FLAT_DOWNSTREAM_RULE,
+                FLAT_TABLE,
                 install);
     }
 
-    private void setUpstreamRules(InstancePort instPort, boolean install) {
+    private void setUpstreamRulesForFlat(InstancePort instPort, boolean install) {
         TrafficSelector selector = DefaultTrafficSelector.builder()
                 .matchInPort(instPort.portNumber())
                 .build();
@@ -217,8 +309,8 @@ public final class OpenstackSwitchingHandler {
                 instPort.deviceId(),
                 selector,
                 treatment,
-                PRIORITY_FLAT_RULE,
-                SRC_VNI_TABLE,
+                PRIORITY_FLAT_UPSTREAM_RULE,
+                FLAT_TABLE,
                 install);
     }
 
@@ -230,7 +322,7 @@ public final class OpenstackSwitchingHandler {
      * @param instPort instance port object
      * @param install install flag, add the rule if true, remove it otherwise
      */
-    private void setForwardingRules(InstancePort instPort, boolean install) {
+    private void setForwardingRulesForVxlan(InstancePort instPort, boolean install) {
         // switching rules for the instPorts in the same node
         TrafficSelector selector = DefaultTrafficSelector.builder()
                 // TODO: need to handle IPv6 in near future
@@ -322,8 +414,9 @@ public final class OpenstackSwitchingHandler {
                         remoteNode.vlanIntf() != null)
                 .forEach(remoteNode -> {
                     TrafficTreatment treatmentToRemote = DefaultTrafficTreatment.builder()
-                                    .setOutput(remoteNode.vlanPortNum())
-                                    .build();
+                            .setEthDst(instPort.macAddress())
+                            .setOutput(remoteNode.vlanPortNum())
+                            .build();
 
                     osFlowRuleService.setRule(
                             appId,
@@ -371,7 +464,7 @@ public final class OpenstackSwitchingHandler {
                 selector,
                 tb.build(),
                 PRIORITY_TUNNEL_TAG_RULE,
-                SRC_VNI_TABLE,
+                VTAG_TABLE,
                 install);
     }
 
@@ -402,7 +495,7 @@ public final class OpenstackSwitchingHandler {
                 selector,
                 treatment,
                 PRIORITY_TUNNEL_TAG_RULE,
-                SRC_VNI_TABLE,
+                VTAG_TABLE,
                 install);
     }
 
@@ -437,6 +530,7 @@ public final class OpenstackSwitchingHandler {
                 );
     }
 
+    // TODO: need to be purged sooner or later
     private void setPortAdminRules(Port port, boolean install) {
         InstancePort instancePort =
                 instancePortService.instancePort(MacAddress.valueOf(port.getMacAddress()));
@@ -454,7 +548,7 @@ public final class OpenstackSwitchingHandler {
                 selector,
                 treatment,
                 PRIORITY_ADMIN_RULE,
-                SRC_VNI_TABLE,
+                VTAG_TABLE,
                 install);
     }
 
@@ -512,23 +606,41 @@ public final class OpenstackSwitchingHandler {
         @Override
         public void event(InstancePortEvent event) {
             InstancePort instPort = event.subject();
+
             switch (event.type()) {
                 case OPENSTACK_INSTANCE_PORT_UPDATED:
                 case OPENSTACK_INSTANCE_PORT_DETECTED:
-                    eventExecutor.execute(() -> {
-                        log.info("Instance port detected MAC:{} IP:{}",
-                                instPort.macAddress(),
-                                instPort.ipAddress());
-                        instPortDetected(event.subject());
-                    });
+                    log.info("Instance port detected MAC:{} IP:{}",
+                                                        instPort.macAddress(),
+                                                        instPort.ipAddress());
+                    eventExecutor.execute(() ->
+                        instPortDetected(instPort)
+                    );
+
                     break;
                 case OPENSTACK_INSTANCE_PORT_VANISHED:
-                    eventExecutor.execute(() -> {
-                        log.info("Instance port vanished MAC:{} IP:{}",
-                                instPort.macAddress(),
-                                instPort.ipAddress());
-                        instPortRemoved(event.subject());
-                    });
+                    log.info("Instance port vanished MAC:{} IP:{}",
+                                                        instPort.macAddress(),
+                                                        instPort.ipAddress());
+                    eventExecutor.execute(() ->
+                        instPortRemoved(instPort)
+                    );
+
+                    break;
+
+                // we do not consider MIGRATION_STARTED case, because the rules
+                // will be installed to corresponding switches at
+                // OPENSTACK_INSTANCE_PORT_UPDATED phase
+
+                // TODO: we may need to consider to refactor the VM migration
+                // event detection logic for better code readability
+                case OPENSTACK_INSTANCE_MIGRATION_ENDED:
+                    log.info("Instance port vanished MAC:{} IP:{}, " +
+                                 "due to VM migration", instPort.macAddress(),
+                                                        instPort.ipAddress());
+                    eventExecutor.execute(() ->
+                        removeVportRules(instPort)
+                    );
                     break;
                 default:
                     break;

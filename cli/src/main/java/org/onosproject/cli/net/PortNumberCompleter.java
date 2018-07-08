@@ -26,17 +26,22 @@ import org.apache.karaf.shell.console.completer.ArgumentCompleter.ArgumentList;
 import org.onosproject.cli.AbstractChoicesCompleter;
 import org.onosproject.net.Device;
 import org.onosproject.net.DeviceId;
+import org.onosproject.net.PortNumber;
 import org.onosproject.net.device.DeviceService;
 
 /**
- * PortNumber completer.
+ * PortNumber completer, which returns candidates in {@link PortNumber#toString()} form.
  *
  * Assumes argument right before the one being completed is DeviceId.
  */
 public class PortNumberCompleter extends AbstractChoicesCompleter {
 
-    @Override
-    protected List<String> choices() {
+    /**
+     * Look for valid DeviceId in arguments passed so far.
+     *
+     * @return DeviceId found or null if not found
+     */
+    protected DeviceId lookForDeviceId() {
         ArgumentList args = getArgumentList();
         //parse argument list for deviceId
         DeviceService deviceService = getService(DeviceService.class);
@@ -45,15 +50,22 @@ public class PortNumberCompleter extends AbstractChoicesCompleter {
             if (str.contains(":")) {
                 dev = deviceService.getDevice(DeviceId.deviceId(str));
                 if (dev != null) {
-                    break;
+                    return dev.id();
                 }
             }
         }
-        if (dev == null) {
-            return Collections.singletonList("Missing device");
-        }
-        DeviceId deviceId = dev.id();
+        return null;
+    }
 
+    @Override
+    protected List<String> choices() {
+        DeviceId deviceId = lookForDeviceId();
+
+        if (deviceId == null) {
+            return Collections.emptyList();
+        }
+
+        DeviceService deviceService = getService(DeviceService.class);
         return StreamSupport.stream(deviceService.getPorts(deviceId).spliterator(), false)
             .map(port -> port.number().toString())
             .collect(Collectors.toList());

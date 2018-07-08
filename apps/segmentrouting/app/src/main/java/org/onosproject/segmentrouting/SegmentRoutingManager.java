@@ -77,7 +77,7 @@ import org.onosproject.net.flow.TrafficTreatment;
 import org.onosproject.net.flowobjective.FlowObjectiveService;
 import org.onosproject.net.host.HostEvent;
 import org.onosproject.net.host.HostListener;
-import org.onosproject.net.host.HostLocationProbingService;
+import org.onosproject.net.host.HostProbingService;
 import org.onosproject.net.host.HostService;
 import org.onosproject.net.host.InterfaceIpAddress;
 import org.onosproject.net.intent.WorkPartitionService;
@@ -108,6 +108,7 @@ import org.onosproject.segmentrouting.grouphandler.DestinationSet;
 import org.onosproject.segmentrouting.grouphandler.NextNeighbors;
 import org.onosproject.segmentrouting.mcast.McastHandler;
 import org.onosproject.segmentrouting.mcast.McastRole;
+import org.onosproject.segmentrouting.mcast.McastRoleStoreKey;
 import org.onosproject.segmentrouting.pwaas.DefaultL2Tunnel;
 import org.onosproject.segmentrouting.pwaas.DefaultL2TunnelDescription;
 import org.onosproject.segmentrouting.pwaas.DefaultL2TunnelHandler;
@@ -120,10 +121,11 @@ import org.onosproject.segmentrouting.pwaas.L2TunnelDescription;
 
 import org.onosproject.segmentrouting.storekey.DestinationSetNextObjectiveStoreKey;
 import org.onosproject.segmentrouting.storekey.DummyVlanIdStoreKey;
-import org.onosproject.segmentrouting.storekey.McastStoreKey;
+import org.onosproject.segmentrouting.mcast.McastStoreKey;
 import org.onosproject.segmentrouting.storekey.PortNextObjectiveStoreKey;
 import org.onosproject.segmentrouting.storekey.VlanNextObjectiveStoreKey;
 import org.onosproject.segmentrouting.storekey.XConnectStoreKey;
+import org.onosproject.segmentrouting.xconnect.api.XconnectService;
 import org.onosproject.store.serializers.KryoNamespaces;
 import org.onosproject.store.service.EventuallyConsistentMap;
 import org.onosproject.store.service.EventuallyConsistentMapBuilder;
@@ -145,6 +147,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -184,7 +187,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     HostService hostService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
-    HostLocationProbingService probingService;
+    HostProbingService probingService;
 
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     public DeviceService deviceService;
@@ -228,6 +231,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     public LeadershipService leadershipService;
 
+    @Reference(cardinality = ReferenceCardinality.OPTIONAL_UNARY)
+    public XconnectService xconnectService;
+
     @Property(name = "activeProbing", boolValue = true,
             label = "Enable active probing to discover dual-homed hosts.")
     boolean activeProbing = true;
@@ -236,6 +242,10 @@ public class SegmentRoutingManager implements SegmentRoutingService {
             label = "Enable administratively taking down single-homed hosts "
                     + "when all uplinks are gone")
     boolean singleHomedDown = false;
+
+    @Property(name = "respondToUnknownHosts", boolValue = true,
+            label = "Enable this to respond to ARP/NDP requests from unknown hosts.")
+    boolean respondToUnknownHosts = true;
 
     ArpHandler arpHandler = null;
     IcmpHandler icmpHandler = null;
@@ -277,6 +287,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private ScheduledExecutorService hostEventExecutor;
     private ScheduledExecutorService routeEventExecutor;
     private ScheduledExecutorService mcastEventExecutor;
+    private ExecutorService packetExecutor;
 
     Map<DeviceId, DefaultGroupHandler> groupHandlerMap = new ConcurrentHashMap<>();
     /**
@@ -354,11 +365,14 @@ public class SegmentRoutingManager implements SegmentRoutingService {
      * Segment Routing App ID.
      */
     public static final String APP_NAME = "org.onosproject.segmentrouting";
-
     /**
      * The default VLAN ID assigned to the interfaces without subnet config.
      */
     public static final VlanId INTERNAL_VLAN = VlanId.vlanId((short) 4094);
+    /**
+     * The Vlan id used to transport pseudowire traffic across the network.
+     */
+    public static final VlanId PSEUDOWIRE_VLAN = VlanId.vlanId((short) 4093);
 
     /**
      * Minumum and maximum value of dummy VLAN ID to be allocated.
@@ -376,6 +390,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
         hostEventExecutor = Executors.newSingleThreadScheduledExecutor(groupedThreads("sr-event-host", "%d", log));
         routeEventExecutor = Executors.newSingleThreadScheduledExecutor(groupedThreads("sr-event-route", "%d", log));
         mcastEventExecutor = Executors.newSingleThreadScheduledExecutor(groupedThreads("sr-event-mcast", "%d", log));
+        packetExecutor = Executors.newSingleThreadExecutor(groupedThreads("sr-packet", "%d", log));
 
         log.debug("Creating EC map nsnextobjectivestore");
         EventuallyConsistentMapBuilder<DestinationSetNextObjectiveStoreKey, NextNeighbors>
@@ -507,6 +522,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
                 .register(DestinationSetNextObjectiveStoreKey.class,
                           VlanNextObjectiveStoreKey.class,
                           DestinationSet.class,
+                          DestinationSet.DestinationSetType.class,
                           NextNeighbors.class,
                           Tunnel.class,
                           DefaultTunnel.class,
@@ -529,6 +545,13 @@ public class SegmentRoutingManager implements SegmentRoutingService {
         hostEventExecutor.shutdown();
         routeEventExecutor.shutdown();
         mcastEventExecutor.shutdown();
+        packetExecutor.shutdown();
+
+        mainEventExecutor = null;
+        hostEventExecutor = null;
+        routeEventExecutor = null;
+        mcastEventExecutor = null;
+        packetExecutor = null;
 
         cfgService.removeListener(cfgListener);
         cfgService.unregisterConfigFactory(deviceConfigFactory);
@@ -574,8 +597,8 @@ public class SegmentRoutingManager implements SegmentRoutingService {
             return;
         }
 
-        String strActiveProving = Tools.get(properties, "activeProbing");
-        boolean expectActiveProbing = Boolean.parseBoolean(strActiveProving);
+        String strActiveProbing = Tools.get(properties, "activeProbing");
+        boolean expectActiveProbing = Boolean.parseBoolean(strActiveProbing);
         if (expectActiveProbing != activeProbing) {
             activeProbing = expectActiveProbing;
             log.info("{} active probing", activeProbing ? "Enabling" : "Disabling");
@@ -598,6 +621,13 @@ public class SegmentRoutingManager implements SegmentRoutingService {
                 log.warn("Disabling singleHomedDown does not re-enable already "
                         + "downed ports for single-homed hosts");
             }
+        }
+
+        String strRespondToUnknownHosts = Tools.get(properties, "respondToUnknownHosts");
+        boolean expectRespondToUnknownHosts = Boolean.parseBoolean(strRespondToUnknownHosts);
+        if (expectRespondToUnknownHosts != respondToUnknownHosts) {
+            respondToUnknownHosts = expectRespondToUnknownHosts;
+            log.info("{} responding to ARPs/NDPs from unknown hosts", respondToUnknownHosts ? "Enabling" : "Disabling");
         }
     }
 
@@ -751,6 +781,11 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     }
 
     @Override
+    public Map<McastRoleStoreKey, McastRole> getMcastRoles(IpAddress mcastIp, ConnectPoint sourcecp) {
+        return mcastHandler.getMcastRoles(mcastIp, sourcecp);
+    }
+
+    @Override
     public Map<ConnectPoint, List<ConnectPoint>> getMcastPaths(IpAddress mcastIp) {
         return mcastHandler.getMcastPaths(mcastIp);
     }
@@ -778,11 +813,7 @@ public class SegmentRoutingManager implements SegmentRoutingService {
                 ImmutableMap.copyOf(defaultRoutingHandler.shouldProgramCache);
     }
 
-    /**
-     * Extracts the application ID from the manager.
-     *
-     * @return application ID
-     */
+    @Override
     public ApplicationId appId() {
         return appId;
     }
@@ -859,38 +890,21 @@ public class SegmentRoutingManager implements SegmentRoutingService {
         return tunnelHandler.getTunnel(tunnelId);
     }
 
-    /**
-     * Returns internal VLAN for untagged hosts on given connect point.
-     * <p>
-     * The internal VLAN is either vlan-untagged for an access port,
-     * or vlan-native for a trunk port.
-     *
-     * @param connectPoint connect point
-     * @return internal VLAN or null if both vlan-untagged and vlan-native are undefined
-     */
+    @Override
     public VlanId getInternalVlanId(ConnectPoint connectPoint) {
         VlanId untaggedVlanId = interfaceService.getUntaggedVlanId(connectPoint);
         VlanId nativeVlanId = interfaceService.getNativeVlanId(connectPoint);
         return untaggedVlanId != null ? untaggedVlanId : nativeVlanId;
     }
 
-    /**
-     * Returns optional pair device ID of given device.
-     *
-     * @param deviceId device ID
-     * @return optional pair device ID. Might be empty if pair device is not configured
-     */
-    Optional<DeviceId> getPairDeviceId(DeviceId deviceId) {
+    @Override
+    public Optional<DeviceId> getPairDeviceId(DeviceId deviceId) {
         SegmentRoutingDeviceConfig deviceConfig =
                 cfgService.getConfig(deviceId, SegmentRoutingDeviceConfig.class);
         return Optional.ofNullable(deviceConfig).map(SegmentRoutingDeviceConfig::pairDeviceId);
     }
-    /**
-     * Returns optional pair device local port of given device.
-     *
-     * @param deviceId device ID
-     * @return optional pair device ID. Might be empty if pair device is not configured
-     */
+
+    @Override
     public Optional<PortNumber> getPairLocalPort(DeviceId deviceId) {
         SegmentRoutingDeviceConfig deviceConfig =
                 cfgService.getConfig(deviceId, SegmentRoutingDeviceConfig.class);
@@ -1030,7 +1044,10 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalPacketProcessor implements PacketProcessor {
         @Override
         public void process(PacketContext context) {
+            packetExecutor.execute(() -> processPacketInternal(context));
+        }
 
+        private void processPacketInternal(PacketContext context) {
             if (context.isHandled()) {
                 return;
             }
@@ -1512,6 +1529,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
 
         @Override
         public void event(NetworkConfigEvent event) {
+            if (mainEventExecutor == null) {
+                return;
+            }
             checkState(appCfgHandler != null, "NetworkConfigEventHandler is not initialized");
             checkState(xConnectHandler != null, "XConnectHandler is not initialized");
             switch (event.type()) {
@@ -1565,6 +1585,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalLinkListener implements LinkListener {
         @Override
         public void event(LinkEvent event) {
+            if (mainEventExecutor == null) {
+                return;
+            }
             if (event.type() == LinkEvent.Type.LINK_ADDED ||
                     event.type() == LinkEvent.Type.LINK_UPDATED ||
                     event.type() == LinkEvent.Type.LINK_REMOVED) {
@@ -1581,6 +1604,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalDeviceListener implements DeviceListener {
         @Override
         public void event(DeviceEvent event) {
+            if (mainEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
                 case DEVICE_ADDED:
                 case PORT_UPDATED:
@@ -1602,6 +1628,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalTopologyListener implements TopologyListener {
         @Override
         public void event(TopologyEvent event) {
+            if (mainEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
                 case TOPOLOGY_CHANGED:
                     log.trace("Schedule Topology event {}", event);
@@ -1619,6 +1648,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalHostListener implements HostListener {
         @Override
         public void event(HostEvent event) {
+            if (hostEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
                 case HOST_ADDED:
                 case HOST_MOVED:
@@ -1637,6 +1669,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalMcastListener implements McastListener {
         @Override
         public void event(McastEvent event) {
+            if (mcastEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
                 case SOURCES_ADDED:
                 case SOURCES_REMOVED:
@@ -1657,6 +1692,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalRouteEventListener implements RouteListener {
         @Override
         public void event(RouteEvent event) {
+            if (routeEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
                 case ROUTE_ADDED:
                 case ROUTE_UPDATED:
@@ -1675,6 +1713,9 @@ public class SegmentRoutingManager implements SegmentRoutingService {
     private class InternalMastershipListener implements MastershipListener {
         @Override
         public void event(MastershipEvent event) {
+            if (mainEventExecutor == null) {
+                return;
+            }
             switch (event.type()) {
             case MASTER_CHANGED:
                 log.debug("Mastership event: {}/{}", event.subject(),

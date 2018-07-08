@@ -17,6 +17,7 @@
 package org.onosproject.drivers.p4runtime;
 
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 import org.onosproject.drivers.p4runtime.mirror.P4RuntimeGroupMirror;
 import org.onosproject.drivers.p4runtime.mirror.TimedEntry;
 import org.onosproject.net.DeviceId;
@@ -30,6 +31,7 @@ import org.onosproject.net.pi.model.PiActionProfileId;
 import org.onosproject.net.pi.model.PiActionProfileModel;
 import org.onosproject.net.pi.runtime.PiActionGroup;
 import org.onosproject.net.pi.runtime.PiActionGroupHandle;
+import org.onosproject.net.pi.runtime.PiActionGroupMember;
 import org.onosproject.net.pi.service.PiGroupTranslator;
 import org.onosproject.net.pi.service.PiTranslatedEntity;
 import org.onosproject.net.pi.service.PiTranslationException;
@@ -40,14 +42,15 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static java.lang.String.format;
 import static org.onosproject.p4runtime.api.P4RuntimeClient.WriteOperationType.DELETE;
 import static org.onosproject.p4runtime.api.P4RuntimeClient.WriteOperationType.INSERT;
+import static org.onosproject.p4runtime.api.P4RuntimeClient.WriteOperationType.MODIFY;
 import static org.slf4j.LoggerFactory.getLogger;
 
 /**
@@ -57,26 +60,25 @@ public class P4RuntimeGroupProgrammable
         extends AbstractP4RuntimeHandlerBehaviour
         implements GroupProgrammable {
 
-    private enum Operation {
-        APPLY, REMOVE
-    }
-
     private static final String ACT_GRP_MEMS_STR = "action group members";
     private static final String DELETE_STR = "delete";
     private static final String ACT_GRP_STR = "action group";
     private static final String INSERT_STR = "insert";
+    private static final String MODIFY_STR = "modify";
 
     private static final Logger log = getLogger(P4RuntimeGroupProgrammable.class);
 
     // If true, we ignore re-installing groups that are already known in the
     // device mirror.
-    private boolean checkMirrorBeforeUpdate = true;
+    private static final String CHECK_MIRROR_BEFORE_UPDATE = "checkMirrorBeforeUpdate";
+    private static final boolean DEFAULT_CHECK_MIRROR_BEFORE_UPDATE = true;
 
     // If true, we avoid querying the device and return what's already known by
     // the ONOS store.
-    private boolean ignoreDeviceWhenGet = true;
+    private static final String IGNORE_DEVICE_WHEN_GET = "ignoreDeviceWhenGet";
+    private static final boolean DEFAULT_IGNORE_DEVICE_WHEN_GET = false;
 
-    private GroupStore groupStore;
+    protected GroupStore groupStore;
     private P4RuntimeGroupMirror groupMirror;
     private PiGroupTranslator translator;
 
@@ -109,7 +111,7 @@ public class P4RuntimeGroupProgrammable
         if (!setupBehaviour()) {
             return Collections.emptyList();
         }
-        if (!ignoreDeviceWhenGet) {
+        if (!driverBoolProperty(IGNORE_DEVICE_WHEN_GET, DEFAULT_IGNORE_DEVICE_WHEN_GET)) {
             return pipeconf.pipelineModel().actionProfiles().stream()
                     .map(PiActionProfileModel::id)
                     .flatMap(this::streamGroupsFromDevice)
@@ -143,21 +145,8 @@ public class P4RuntimeGroupProgrammable
         final Lock lock = GROUP_LOCKS.computeIfAbsent(handle, k -> new ReentrantLock());
         lock.lock();
         try {
-            final Operation operation;
-            switch (groupOp.opType()) {
-                case ADD:
-                case MODIFY:
-                    operation = Operation.APPLY;
-                    break;
-                case DELETE:
-                    operation = Operation.REMOVE;
-                    break;
-                default:
-                    log.warn("Group operation {} not supported", groupOp.opType());
-                    return;
-            }
             processPiGroup(handle, piGroup,
-                           groupOnDevice, pdGroup, operation);
+                           groupOnDevice, pdGroup, groupOp.opType());
         } finally {
             lock.unlock();
         }
@@ -166,29 +155,93 @@ public class P4RuntimeGroupProgrammable
     private void processPiGroup(PiActionGroupHandle handle,
                                 PiActionGroup groupToApply,
                                 PiActionGroup groupOnDevice,
-                                Group pdGroup, Operation operation) {
-        if (operation == Operation.APPLY) {
+                                Group pdGroup, GroupOperation.Type operationType) {
+        if (operationType == GroupOperation.Type.ADD) {
             if (groupOnDevice != null) {
-                if (checkMirrorBeforeUpdate
-                        && groupOnDevice.equals(groupToApply)) {
-                    // Group on device has the same members, ignore operation.
-                    return;
-                }
-                // Remove before adding it.
-                processPiGroup(handle, groupToApply, groupOnDevice,
-                               pdGroup, Operation.REMOVE);
+                log.warn("Unable to add group {} since group already on device {}",
+                         groupToApply.id(), deviceId);
+                log.debug("To apply: {}", groupToApply);
+                log.debug("On device: {}", groupOnDevice);
+                return;
             }
+
             if (writeGroupToDevice(groupToApply)) {
                 groupMirror.put(handle, groupToApply);
                 translator.learn(handle, new PiTranslatedEntity<>(
                         pdGroup, groupToApply, handle));
             }
+        } else if (operationType == GroupOperation.Type.MODIFY) {
+            if (groupOnDevice == null) {
+                log.warn("Group {} does not exists on device {}, can not modify it",
+                         groupToApply.id(), deviceId);
+                return;
+            }
+            if (driverBoolProperty(CHECK_MIRROR_BEFORE_UPDATE, DEFAULT_CHECK_MIRROR_BEFORE_UPDATE)
+                    && groupOnDevice.equals(groupToApply)) {
+                // Group on device has the same members, ignore operation.
+                return;
+            }
+            if (modifyGroupFromDevice(groupToApply, groupOnDevice)) {
+                groupMirror.put(handle, groupToApply);
+                translator.learn(handle,
+                                 new PiTranslatedEntity<>(pdGroup, groupToApply, handle));
+            }
         } else {
-            if (deleteGroupFromDevice(groupToApply)) {
+            if (groupOnDevice == null) {
+                log.warn("Unable to remove group {} from device {} since it does" +
+                                 "not exists on device.", groupToApply.id(), deviceId);
+                return;
+            }
+            if (deleteGroupFromDevice(groupOnDevice)) {
                 groupMirror.remove(handle);
                 translator.forget(handle);
             }
         }
+    }
+
+    private boolean modifyGroupFromDevice(PiActionGroup groupToApply, PiActionGroup groupOnDevice) {
+        PiActionProfileId groupProfileId = groupToApply.actionProfileId();
+        Collection<PiActionGroupMember> membersToRemove = Sets.newHashSet(groupOnDevice.members());
+        membersToRemove.removeAll(groupToApply.members());
+        Collection<PiActionGroupMember> membersToAdd = Sets.newHashSet(groupToApply.members());
+        membersToAdd.removeAll(groupOnDevice.members());
+
+        if (!membersToAdd.isEmpty() &&
+                !completeFuture(client.writeActionGroupMembers(groupProfileId, membersToAdd, INSERT, pipeconf),
+                                ACT_GRP_MEMS_STR, INSERT_STR)) {
+            // remove what we added
+            completeFuture(client.writeActionGroupMembers(groupProfileId, membersToAdd, DELETE, pipeconf),
+                           ACT_GRP_MEMS_STR, INSERT_STR);
+            return false;
+        }
+
+        if (!completeFuture(client.writeActionGroup(groupToApply, MODIFY, pipeconf),
+                            ACT_GRP_STR, MODIFY_STR)) {
+            // recover group information
+            completeFuture(client.writeActionGroup(groupOnDevice, MODIFY, pipeconf),
+                           ACT_GRP_STR, MODIFY_STR);
+            // remove what we added
+            completeFuture(client.writeActionGroupMembers(groupProfileId, membersToAdd, DELETE, pipeconf),
+                           ACT_GRP_MEMS_STR, INSERT_STR);
+            return false;
+        }
+
+        if (!membersToRemove.isEmpty() &&
+                !completeFuture(client.writeActionGroupMembers(groupProfileId, membersToRemove, DELETE, pipeconf),
+                                ACT_GRP_MEMS_STR, DELETE_STR)) {
+            // add what we removed
+            completeFuture(client.writeActionGroupMembers(groupProfileId, membersToRemove, INSERT, pipeconf),
+                           ACT_GRP_MEMS_STR, DELETE_STR);
+            // recover group information
+            completeFuture(client.writeActionGroup(groupOnDevice, MODIFY, pipeconf),
+                           ACT_GRP_STR, MODIFY_STR);
+            // remove what we added
+            completeFuture(client.writeActionGroupMembers(groupProfileId, membersToAdd, DELETE, pipeconf),
+                           ACT_GRP_MEMS_STR, INSERT_STR);
+            return false;
+        }
+
+        return true;
     }
 
     private boolean writeGroupToDevice(PiActionGroup groupToApply) {
@@ -196,7 +249,9 @@ public class P4RuntimeGroupProgrammable
         // The operation is deemed successful if both operations are successful.
         // FIXME: add transactional semantics, i.e. remove members if group fails.
         final boolean membersSuccess = completeFuture(
-                client.writeActionGroupMembers(groupToApply, INSERT, pipeconf),
+                client.writeActionGroupMembers(groupToApply.actionProfileId(),
+                                               groupToApply.members(),
+                                               INSERT, pipeconf),
                 ACT_GRP_MEMS_STR, INSERT_STR);
         return membersSuccess && completeFuture(
                 client.writeActionGroup(groupToApply, INSERT, pipeconf),
@@ -210,37 +265,26 @@ public class P4RuntimeGroupProgrammable
                 client.writeActionGroup(piActionGroup, DELETE, pipeconf),
                 ACT_GRP_STR, DELETE_STR);
         return groupSuccess && completeFuture(
-                client.writeActionGroupMembers(piActionGroup, DELETE, pipeconf),
+                client.writeActionGroupMembers(piActionGroup.actionProfileId(),
+                                               piActionGroup.members(),
+                                               DELETE, pipeconf),
                 ACT_GRP_MEMS_STR, DELETE_STR);
     }
 
     private boolean completeFuture(CompletableFuture<Boolean> completableFuture,
                                    String topic, String action) {
-        try {
-            if (completableFuture.get()) {
-                return true;
-            } else {
-                log.warn("Unable to {} {}", action, topic);
-                return false;
-            }
-        } catch (InterruptedException | ExecutionException e) {
-            log.warn("Exception while performing {} {}: {}", action, topic, e.getMessage());
-            log.debug("Exception", e);
-            return false;
-        }
+        return getFutureWithDeadline(
+                completableFuture, format("performing %s %s", action, topic), false);
     }
 
     private Stream<Group> streamGroupsFromDevice(PiActionProfileId actProfId) {
-        try {
-            // Read PI groups and return original PD one.
-            return client.dumpGroups(actProfId, pipeconf).get().stream()
-                    .map(this::forgeGroupEntry)
-                    .filter(Objects::nonNull);
-        } catch (ExecutionException | InterruptedException e) {
-            log.error("Exception while dumping groups from action profile '{}' on {}: {}",
-                      actProfId.id(), deviceId, e);
-            return Stream.empty();
-        }
+        // Read PI groups and return original PD one.
+        Collection<PiActionGroup> groups = getFutureWithDeadline(
+                client.dumpGroups(actProfId, pipeconf),
+                "dumping groups", Collections.emptyList());
+        return groups.stream()
+                .map(this::forgeGroupEntry)
+                .filter(Objects::nonNull);
     }
 
     private Group forgeGroupEntry(PiActionGroup piGroup) {

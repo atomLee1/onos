@@ -74,10 +74,12 @@ public class OSGiWrapper {
     private String bundleLicense;
 
     private String webContext;
+    private String webXmlRoot;
+    private String destdir;
 
     // FIXME should consider using Commons CLI, etc.
     public static void main(String[] args) {
-        if (args.length < 12) {
+        if (args.length < 13) {
             System.err.println("Not enough args");
             System.exit(1);
         }
@@ -93,7 +95,9 @@ public class OSGiWrapper {
         String exportPackages = args[8];
         String includeResources = args[9];
         String webContext = args[10];
-        String dynamicimportPackages = args[11];
+        String webXmlRoot = args[11];
+        String dynamicimportPackages = args[12];
+        String destdir = args[13];
         String desc = Joiner.on(' ').join(Arrays.copyOfRange(args, 12, args.length));
 
         OSGiWrapper wrapper = new OSGiWrapper(jar, output, cp,
@@ -102,8 +106,10 @@ public class OSGiWrapper {
                                               importPackages, exportPackages,
                                               includeResources,
                                               webContext,
+                                              webXmlRoot,
                                               dynamicimportPackages,
-                                              desc);
+                                              desc,
+                                              destdir);
         wrapper.log(wrapper + "\n");
         if (!wrapper.execute()) {
             System.err.printf("Error generating %s\n", name);
@@ -123,8 +129,10 @@ public class OSGiWrapper {
                        String exportPackages,
                        String includeResources,
                        String webContext,
+                       String webXmlRoot,
                        String dynamicimportPackages,
-                       String bundleDescription) {
+                       String bundleDescription,
+                       String destdir) {
         this.inputJar = inputJar;
         this.classpath = Lists.newArrayList(classpath.split(":"));
         if (!this.classpath.contains(inputJar)) {
@@ -151,6 +159,8 @@ public class OSGiWrapper {
         }
 
         this.webContext = webContext;
+        this.webXmlRoot = webXmlRoot;
+        this.destdir = destdir;
     }
 
     private void setProperties(Analyzer analyzer) {
@@ -179,7 +189,7 @@ public class OSGiWrapper {
         }
 
         if (isWab()) {
-            analyzer.setProperty(Analyzer.WAB, "src/main/webapp/");
+            analyzer.setProperty(Analyzer.WAB, webXmlRoot);
             analyzer.setProperty("Web-ContextPath", webContext);
             analyzer.setProperty(Analyzer.IMPORT_PACKAGE, "*,org.glassfish.jersey.servlet,org.jvnet.mimepull\n");
         }
@@ -209,6 +219,8 @@ public class OSGiWrapper {
 
             // Scan the JAR for Felix SCR annotations and generate XML files
             Map<String, String> properties = Maps.newHashMap();
+            // destdir hack
+            properties.put("destdir", destdir);
             SCRDescriptorBndPlugin scrDescriptorBndPlugin = new SCRDescriptorBndPlugin();
             scrDescriptorBndPlugin.setProperties(properties);
             scrDescriptorBndPlugin.setReporter(analyzer);
@@ -274,6 +286,7 @@ public class OSGiWrapper {
         }
 
         Path wabRoot = Paths.get(wab);
+        log("wab root " + wabRoot.toString());
         includeFiles(dot, null, wabRoot.toString());
     }
 

@@ -67,6 +67,7 @@ import org.onosproject.net.flow.criteria.UdpPortCriterion;
 import org.onosproject.net.flow.criteria.VlanIdCriterion;
 import org.onosproject.net.flow.instructions.Instruction;
 import org.onosproject.net.flow.instructions.Instructions.OutputInstruction;
+import org.onosproject.net.flow.instructions.Instructions.NoActionInstruction;
 import org.onosproject.net.flow.instructions.L2ModificationInstruction;
 import org.onosproject.net.flow.instructions.L2ModificationInstruction.L2SubType;
 import org.onosproject.net.flow.instructions.L2ModificationInstruction.ModVlanIdInstruction;
@@ -282,6 +283,15 @@ public class Ofdpa2Pipeline extends AbstractHandlerBehaviour implements Pipeline
      */
     protected boolean requireUnicastBeforeMulticast() {
         return false;
+    }
+
+    /**
+     * Determines whether this driver supports installing a clearDeferred action on table 30.
+     *
+     * @return true if required
+     */
+    protected boolean supportsUnicastBlackHole() {
+        return true;
     }
 
     //////////////////////////////////////
@@ -502,7 +512,7 @@ public class Ofdpa2Pipeline extends AbstractHandlerBehaviour implements Pipeline
 
         if (ethCriterion == null || ethCriterion.mac().equals(NONE)) {
             // NOTE: it is possible that a filtering objective only has vidCriterion
-            log.warn("filtering objective missing dstMac, cannot program TMAC table");
+            log.debug("filtering objective missing dstMac, won't program TMAC table");
         } else {
             MacAddress unicastMac = readEthDstFromTreatment(filt.meta());
             List<List<FlowRule>> allStages = processEthDstFilter(portCriterion, ethCriterion,
@@ -1148,14 +1158,6 @@ public class Ofdpa2Pipeline extends AbstractHandlerBehaviour implements Pipeline
         log.debug("Processing versatile forwarding objective:{} in dev:{}",
                  fwd.id(), deviceId);
 
-        EthTypeCriterion ethType =
-                (EthTypeCriterion) fwd.selector().getCriterion(Criterion.Type.ETH_TYPE);
-        if (ethType == null) {
-            log.error("Versatile forwarding objective:{} must include ethType",
-                      fwd.id());
-            fail(fwd, ObjectiveError.BADPARAMS);
-            return Collections.emptySet();
-        }
         if (fwd.nextId() == null && fwd.treatment() == null) {
             log.error("Forwarding objective {} from {} must contain "
                     + "nextId or Treatment", fwd.selector(), fwd.appId());
@@ -1220,6 +1222,8 @@ public class Ofdpa2Pipeline extends AbstractHandlerBehaviour implements Pipeline
                         log.warn("Only allowed treatments in versatile forwarding "
                                 + "objectives are punts to the controller");
                     }
+                } else if (ins instanceof NoActionInstruction) {
+                    // No action is allowed and nothing needs to be done
                 } else {
                     log.warn("Cannot process instruction in versatile fwd {}", ins);
                 }
@@ -1460,6 +1464,15 @@ public class Ofdpa2Pipeline extends AbstractHandlerBehaviour implements Pipeline
             tb.transition(mplsNextTable);
         } else {
             tb.transition(ACL_TABLE);
+        }
+
+        if (fwd.treatment() != null && fwd.treatment().clearedDeferred()) {
+            if (supportsUnicastBlackHole()) {
+                tb.wipeDeferred();
+            } else {
+                log.warn("Clear Deferred is not supported Unicast Routing Table on device {}", deviceId);
+                return Collections.emptySet();
+            }
         }
 
         FlowRule.Builder ruleBuilder = DefaultFlowRule.builder()

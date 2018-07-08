@@ -15,16 +15,21 @@
  */
 package org.onosproject.segmentrouting;
 
+import com.google.common.annotations.Beta;
 import com.google.common.collect.Multimap;
+import org.apache.commons.lang3.NotImplementedException;
 import org.onlab.packet.IpAddress;
 import org.onlab.packet.IpPrefix;
+import org.onlab.packet.VlanId;
 import org.onosproject.cluster.NodeId;
+import org.onosproject.core.ApplicationId;
 import org.onosproject.net.ConnectPoint;
 import org.onosproject.net.DeviceId;
 import org.onosproject.net.Link;
 import org.onosproject.net.PortNumber;
 import org.onosproject.segmentrouting.grouphandler.NextNeighbors;
 import org.onosproject.segmentrouting.mcast.McastRole;
+import org.onosproject.segmentrouting.mcast.McastRoleStoreKey;
 import org.onosproject.segmentrouting.pwaas.DefaultL2TunnelDescription;
 import org.onosproject.segmentrouting.pwaas.L2Tunnel;
 import org.onosproject.segmentrouting.pwaas.L2TunnelHandler;
@@ -33,10 +38,11 @@ import org.onosproject.segmentrouting.pwaas.L2TunnelDescription;
 import org.onosproject.segmentrouting.storekey.DestinationSetNextObjectiveStoreKey;
 
 import com.google.common.collect.ImmutableMap;
-import org.onosproject.segmentrouting.storekey.McastStoreKey;
+import org.onosproject.segmentrouting.mcast.McastStoreKey;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -44,8 +50,19 @@ import java.util.Set;
  */
 public interface SegmentRoutingService {
     /**
-     * VLAN cross-connect priority.
+     * VLAN cross-connect ACL priority.
+     *
+     * @deprecated in ONOS 1.12. Replaced by {@link org.onosproject.segmentrouting.xconnect.api.XconnectService}
      */
+    @Deprecated
+    int XCONNECT_ACL_PRIORITY = 60000;
+
+    /**
+     * VLAN cross-connect Bridging priority.
+     *
+     * @deprecated in ONOS 1.12. Replaced by {@link org.onosproject.segmentrouting.xconnect.api.XconnectService}
+     */
+    @Deprecated
     int XCONNECT_PRIORITY = 1000;
 
     /**
@@ -223,7 +240,7 @@ public interface SegmentRoutingService {
      */
     ImmutableMap<DeviceId, Set<PortNumber>> getDownedPortState();
 
-   /**
+    /**
      * Returns the associated next ids to the mcast groups or to the single
      * group if mcastIp is present.
      *
@@ -245,6 +262,16 @@ public interface SegmentRoutingService {
     Map<McastStoreKey, McastRole> getMcastRoles(IpAddress mcastIp);
 
     /**
+     * Returns the associated roles to the mcast groups.
+     *
+     * @param mcastIp the group ip
+     * @param sourcecp the source connect point
+     * @return the mapping mcastIp-device to mcast role
+     */
+    Map<McastRoleStoreKey, McastRole> getMcastRoles(IpAddress mcastIp,
+                                                    ConnectPoint sourcecp);
+
+    /**
      * Returns the associated paths to the mcast group.
      *
      * @param mcastIp the group ip
@@ -254,7 +281,6 @@ public interface SegmentRoutingService {
      */
     @Deprecated
     Map<ConnectPoint, List<ConnectPoint>> getMcastPaths(IpAddress mcastIp);
-
 
     /**
      * Returns the associated trees to the mcast group.
@@ -287,4 +313,51 @@ public interface SegmentRoutingService {
      * @return shouldProgram local cache
      */
     Map<DeviceId, Boolean> getShouldProgramCache();
+
+    /**
+     * Gets application id.
+     *
+     * @return application id
+     */
+    default ApplicationId appId() {
+        throw new NotImplementedException("appId not implemented");
+    }
+
+    /**
+     * Returns internal VLAN for untagged hosts on given connect point.
+     * <p>
+     * The internal VLAN is either vlan-untagged for an access port,
+     * or vlan-native for a trunk port.
+     *
+     * @param connectPoint connect point
+     * @return internal VLAN or null if both vlan-untagged and vlan-native are undefined
+     */
+    @Beta
+    default VlanId getInternalVlanId(ConnectPoint connectPoint) {
+        throw new NotImplementedException("getInternalVlanId not implemented");
+    }
+
+
+    /**
+     * Returns optional pair device ID of given device.
+     *
+     * @param deviceId device ID
+     * @return optional pair device ID. Might be empty if pair device is not configured
+     */
+    @Beta
+    default Optional<DeviceId> getPairDeviceId(DeviceId deviceId) {
+        throw new NotImplementedException("getPairDeviceId not implemented");
+    }
+
+
+    /**
+     * Returns optional pair device local port of given device.
+     *
+     * @param deviceId device ID
+     * @return optional pair device ID. Might be empty if pair device is not configured
+     */
+    @Beta
+    default Optional<PortNumber> getPairLocalPort(DeviceId deviceId) {
+        throw new NotImplementedException("getPairLocalPort not implemented");
+    }
 }

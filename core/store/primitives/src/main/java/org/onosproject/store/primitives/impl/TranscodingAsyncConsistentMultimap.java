@@ -16,15 +16,6 @@
 
 package org.onosproject.store.primitives.impl;
 
-import com.google.common.collect.ImmutableMultiset;
-import com.google.common.collect.Maps;
-import com.google.common.collect.Multiset;
-import org.onlab.util.Tools;
-import org.onosproject.store.service.AsyncConsistentMultimap;
-import org.onosproject.store.service.MultimapEvent;
-import org.onosproject.store.service.MultimapEventListener;
-import org.onosproject.store.service.Versioned;
-
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Map;
@@ -38,6 +29,16 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collector;
 import java.util.stream.Collectors;
+
+import com.google.common.collect.ImmutableMultiset;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Multiset;
+import org.onlab.util.Tools;
+import org.onosproject.store.service.AsyncConsistentMultimap;
+import org.onosproject.store.service.AsyncIterator;
+import org.onosproject.store.service.MultimapEvent;
+import org.onosproject.store.service.MultimapEventListener;
+import org.onosproject.store.service.Versioned;
 
 /**
  * An {@link AsyncConsistentMultimap} that maps its operation to operations to
@@ -140,10 +141,30 @@ public class TranscodingAsyncConsistentMultimap<K1, V1, K2, V2>
     }
 
     @Override
+    public CompletableFuture<Versioned<Collection<? extends V1>>> putAndGet(K1 key, V1 value) {
+        try {
+            return backingMap.putAndGet(keyEncoder.apply(key), valueEncoder.apply(value))
+                .thenApply(versionedValueCollectionDecode);
+        } catch (Exception e) {
+            return Tools.exceptionalFuture(e);
+        }
+    }
+
+    @Override
     public CompletableFuture<Boolean> remove(K1 key, V1 value) {
         try {
             return backingMap.remove(keyEncoder.apply(key), valueEncoder
                     .apply(value));
+        } catch (Exception e) {
+            return Tools.exceptionalFuture(e);
+        }
+    }
+
+    @Override
+    public CompletableFuture<Versioned<Collection<? extends V1>>> removeAndGet(K1 key, V1 value) {
+        try {
+            return backingMap.removeAndGet(keyEncoder.apply(key), valueEncoder.apply(value))
+                .thenApply(versionedValueCollectionDecode);
         } catch (Exception e) {
             return Tools.exceptionalFuture(e);
         }
@@ -239,6 +260,11 @@ public class TranscodingAsyncConsistentMultimap<K1, V1, K2, V2>
     }
 
     @Override
+    public CompletableFuture<AsyncIterator<Map.Entry<K1, V1>>> iterator() {
+        return backingMap.iterator().thenApply(TranscodingIterator::new);
+    }
+
+    @Override
     public CompletableFuture<Map<K1, Collection<V1>>> asMap() {
         throw new UnsupportedOperationException("Unsupported operation.");
     }
@@ -314,6 +340,25 @@ public class TranscodingAsyncConsistentMultimap<K1, V1, K2, V2>
         @Override
         public Set<Characteristics> characteristics() {
             return EnumSet.of(Characteristics.UNORDERED);
+        }
+    }
+
+    private class TranscodingIterator implements AsyncIterator<Map.Entry<K1, V1>> {
+        private final AsyncIterator<Map.Entry<K2, V2>> iterator;
+
+        public TranscodingIterator(AsyncIterator<Map.Entry<K2, V2>> iterator) {
+            this.iterator = iterator;
+        }
+
+        @Override
+        public CompletableFuture<Boolean> hasNext() {
+            return iterator.hasNext();
+        }
+
+        @Override
+        public CompletableFuture<Map.Entry<K1, V1>> next() {
+            return iterator.next().thenApply(entry ->
+                Maps.immutableEntry(keyDecoder.apply(entry.getKey()), valueDecoder.apply(entry.getValue())));
         }
     }
 
